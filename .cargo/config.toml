@@ -1,2 +1,27 @@
+# This file configures how Cargo compiles the project.
+# It applies to every crate in the workspace.
+
 [build]
+# We tell Cargo to always compile for UEFI 64-bit.
+# x86_64 = 64-bit processor architecture (the one in your PC).
+# unknown = we make no assumption about the OS.
+# uefi = the target environment is the UEFI firmware.
+# Without this, Cargo would compile for Ubuntu (the VM on which
+# the project is developped) by default, which is completely
+# wrong for a bootloader.
 target = "x86_64-unknown-uefi"
+
+[unstable]
+# Normally Rust uses a pre-compiler version of its standard library.
+# Since we are the OS, we cannot use it.
+# So we tell Cargo to recompile only the lowest layers of Rust from scratch.
+# These three layers work without any OS underneath :
+# - core              : basic types (numbers, booleans, slices...)
+# - compiler_builtins : basic math operations the CPU needs
+# - alloc             : dynamic memory allocation (needed by the uefi crate).
+build-std = ["core", "compiler_builtins", "alloc"]
+
+# This enables a specific feature inside compiler_builtins.
+# It provides basic memory operations like memcpy, memset, memcmp.
+# These are used everywhere under the hood, even if you never call them directly.
+build-std-features = ["compiler-builtins-mem"]

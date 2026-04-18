@@ -1,7 +1,26 @@
+# This file describes the bootloader crate to Cargo.
+# A crate is what Rust calls a project or a library
+
 [package]
+# Name of the crate.
 name = "bootloader"
+
+# Current version. We follow semantic versioning : major.minor.patch
 version = "0.1.0"
-edition = "2024"
+
+# The Rust edition defines which version of the Rust syntax we use.
+# 2021 is the current stable edition. Do not use 2024 as it still unstable.
+edition = "2021"
 
 [dependencies]
+# The uefi crate gives us access to all UEFI firmware services :
+# screen output, memory map, disk access, etc.
+# Without it we would have to write all the UEFI protocol code ourselves.
+# Version 0.33 is the latest stable version at the time of writing.
 uefi = "0.33"
+
+# The xmas-elf crate parses ELF files.
+# It reads the ELF header and program headers so we know 
+# where to load each piece of the kernel in memory.
+# It works in no_std mode, which is required for a bootloader.
+xmas-elf = "0.10.0"
