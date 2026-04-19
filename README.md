@@ -10,7 +10,7 @@ so that anyone — even without prior OS development experience — can follow a
 
 ---
 
-## Status
+## Estimated Status (Might be changed in the future)
 
 | Component        | Status      |
 |------------------|-------------|
@@ -38,7 +38,7 @@ UEFI Firmware
 
 ---
 
-## Tech Stack
+## Estimated Tech Stack (Might be changed in the future)
 
 | Layer              | Language             | Reason                                          |
 |--------------------|----------------------|-------------------------------------------------|
@@ -128,7 +128,7 @@ To exit QEMU : `Ctrl+A` then `X`.
 
 ---
 
-## Roadmap
+## Estimated Roadmap (Might be changed in the future)
 
 - [x] Bootloader — UEFI, ELF loading, memory map
 - [x] Kernel stub — bare-metal entry point
@@ -145,7 +145,7 @@ To exit QEMU : `Ctrl+A` then `X`.
 
 ---
 
-## References
+## References (Used by Claude)
 
 - [OSDev Wiki](https://wiki.osdev.org) — OS development reference
 - [UEFI Specification](https://uefi.org/specifications) — UEFI standard
@@ -161,3 +161,15 @@ GPL v3 — see [LICENSE](LICENSE) for details.
 
 This means anyone can use, study, and modify KernOS, but any derivative
 work must remain open-source under the same license.
+
+## AI-Use
+
+AI used is mostly Claude. Used for development purposes. Comments and README.md are generated or enhanced
+By AI to ensure no importants informations are forgotten. 
+If any mistake, bug, or possible improvement is discovered feel free to contact me or propose a commit.
+
+## Final words
+
+As the README, the comments and some parts of the code are AI-driven they are subject to change rapidly
+and frequently. Currently learning as I'm moving forward in this project the structure, code, tech stack choosen
+or any "important" part of the project is also subject to change often.
