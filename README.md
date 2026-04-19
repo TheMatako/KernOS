@@ -52,6 +52,7 @@ UEFI Firmware
 
 ## Project Structure
 
+```
 KernOS/
 ├── .cargo/
 │   └── config.toml          # Workspace-level Cargo configuration
@@ -72,6 +73,7 @@ KernOS/
 ├── Cargo.toml               # Workspace root
 ├── Makefile                 # Build system
 └── README.md
+```
 
 ---
 
