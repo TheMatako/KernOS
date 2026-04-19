@@ -72,6 +72,7 @@ KernOS/
 ├── .gitignore
 ├── Cargo.toml               # Workspace root
 ├── Makefile                 # Build system
+├── LICENSE                  # License
 └── README.md
 ```
 
