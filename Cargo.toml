@@ -1,3 +1,15 @@
 [workspace]
 resolver = "2"
 members = ["bootloader", "kernel"]
+
+
+# Tell the compiler to abort immediately on panic instead of unwinding.
+# Unwinding requires std which we don't have in a bare-metal environment.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

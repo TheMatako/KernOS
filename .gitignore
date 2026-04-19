@@ -1,5 +1,37 @@
+# ============================================================
+# KernOS .gitignore
+# ============================================================
+
+# ------------------------------------------------------------
+# Rust / Cargo
+# ------------------------------------------------------------
+
+# Cargo build output - can be several gigabytes, never commit this.
 /target
+
+# Rust backup files created by cargo fix or rustfmt.
 **/*.rs.bk
-.DS_Store
-.vscode/
+
+# Cargo.lock is committed in binaries but ignored in libraries.
+# For an OS project we ignore it - versions are pinned in Cargo.toml.
 Cargo.lock
+
+# ------------------------------------------------------------
+# Compiled binaries and disk images
+# ------------------------------------------------------------
+*.bin
+*.img
+*.iso
+*.o
+*.elf
+
+# ------------------------------------------------------------
+# Editor
+# ------------------------------------------------------------
+
+# VS Code workspace settings.
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db

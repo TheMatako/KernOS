@@ -1,0 +1,5 @@
+# Kernel-specific Cargo configuration.
+
+[build]
+# Compile for bare-metal x86_64 with no OS underneath.
+target = "x86_64-unknown-none"

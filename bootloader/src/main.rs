@@ -1,173 +1,272 @@
-// We tell the Rust compiler to not use the standard library.
-// The standard library assumes there is an OS underneath.
-// Since we are the bootloader, there is nothing underneath us, se we cannot use it.
+// ============================================================
+// KernOS Bootloader
+// ============================================================
+//
+// This is the first code that runs when the computer starts.
+// It is loaded by the UEFI firmware and is responsible for :
+//
+//   1. Initializing UEFI services
+//   2. Displaying a boot message
+//   3. Loading the kernel from disk
+//   4. Parsing the kernel ELF file and mapping it into memory
+//   5. Retrieving the system memory map
+//   6. Exiting UEFI boot services
+//   7. Jumping to the kernel entry point
+//
+// Language  : Rust (no_std, no_main)
+// Target    : x86_64-unknown-uefi
+// Author    : Matéo Reymond (AI assisted)
+// ============================================================
+
+// We disable the Rust standard library.
+// The standard library assumes an OS exists underneath.
+// Since we ARE the OS, nothing exists beneath us yet.
 #![no_std]
 
-// We tell the Rust compiler that we don't have a classic main() function.
-// Normally Rust looks for a function called main() to start the program.
-// In UEFI, the firmware starts our program its own way, with its own rules.
-// So we disable the automatic main() behavior.
+// We disable the automatic main() entry point.
+// UEFI has its own entry point convention, handled by the #[entry] macro below.
 #![no_main]
 
-// We import the most commonly used UEFI types and functions.
-// "use" is like "import"
-// "prelude::*" means everything that is commonly needed.
+// ------------------------------------------------------------
+// Imports
+// ------------------------------------------------------------
+
+// Core UEFI types : Handle, Status, SystemTable, Boot.
+// These are the fundamental building blocks of any UEFI application.
 use uefi::prelude::*;
 
-// We import MemoryType which descibes what a memory zone is used for.
-use uefi::boot::MemoryType; 
+// MemoryType classifies memory zones.
+// Example : LOADER_DATA = memory used by the bootloader.
+use uefi::boot::MemoryType;
 
-// We import the UEFI file system types to read files from disk.
-// SimpleFileSystem is the UEFI protocol to access FAT32 partition.
-// FileMode and FileAttribute define how we open the file (read only, etc.)
-use uefi::proto::media::file::{File, FileMode, FileAttribute, FileType, FileInfo};
+// File system types for reading files from the FAT32 partition.
+// SimpleFileSystem = the UEFI protocol to access a FAT32 volume.
+// File             = base trait for file and directory operations.
+// FileMode         = read, write, or create.
+// FileAttribute    = file attributes (hidden, read-only, etc.).
+// FileType         = regular file or directory.
+// FileInfo         = file metadata (name, size, timestamps).
+use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode, FileType};
 use uefi::proto::media::fs::SimpleFileSystem;
 
-// We import the ELF parser.
-// This lets us read the ELF header and program headers without
-// writing the parsing code ourselves.
+// ELF parser types.
+// ElfFile    = the parsed representation of an ELF binary.
+// Type       = segment type (LOAD, DYNAMIC, NOTE, etc.).
+// SegmentData = the raw data contained in an ELF segment.
+use xmas_elf::program::{SegmentData, Type};
 use xmas_elf::ElfFile;
-use xmas_elf::program::{Type, SegmentData};
 
-// This attibute tells the UEFI library "this function is the entry point".
-// It replaces the classic fn main() that Rust normally looks for.
-// The firmware will call this function when it loads our bootloader.
+// ------------------------------------------------------------
+// Entry Point
+// ------------------------------------------------------------
+
+// #[entry] marks this function as the UEFI entry point.
+// The firmware calls this function after loading our .efi file.
+// It replaces the classic fn main() used in normal Rust programs.
 #[entry]
 fn main() -> Status {
+    init_uefi();
+    display_banner();
 
-    // -----------------------------------------------------
-    // STEP 1 : Initialize UEFI services
-    // -----------------------------------------------------
-    // Before we can use any UEFI feature (screen, memory, disk...),
-    // we must initialize the UEFI library first.
-    // If we skip this, everything below will crash.
-    // unwrap() means "if this fails, panic and stop immediately".
+    let kernel_data = load_kernel_from_disk();
+    let entry_point = parse_and_load_elf(kernel_data);
+
+    get_memory_map();
+    exit_boot_services();
+    jump_to_kernel(entry_point);
+}
+
+// ------------------------------------------------------------
+// Step 1 : Initialize UEFI services
+// ------------------------------------------------------------
+
+/// Initializes the UEFI helper library.
+///
+/// This must be the very first call in the bootloader.
+/// Without it, no UEFI service (screen, disk, memory) is available.
+/// Calling any UEFI function before this will result in a crash.
+fn init_uefi() {
     uefi::helpers::init().unwrap();
-    
-    // -----------------------------------------------------
-    // STEP 2 : Display a message on screen
-    // -----------------------------------------------------
-    // with_stdout gives us access to the screen for the duration of
-    // this block. When the block ends, access is closed cleanly.
-    // The parameter between | | is the screen handle given to us
-    // by with_stdout. Here we named it "stdout".
-    uefi::system::with_stdout(|stdout| {
-        // cstr16! converts our text to UTF-16 encoding.
-        // UEFI requires UTF-16, it does not understand normal UTF-8 strings.
-        // In UEFI we always need both \r and \n.
-        stdout.clear().unwrap();
-        stdout.output_string(cstr16!("KernOS v0.1.0\r\n")).unwrap();
-        stdout.output_string(cstr16!("Bootloader O.K. !\r\n")).unwrap();
-    });
+}
 
-    // -----------------------------------------------------
-    // STEP 3 : Load the kernel from disk
-    // -----------------------------------------------------
-    // We need to do this before exiting UEFI boot services.
-    // After Step 5, we can no longer access the disk.
-    
-    // First, we get access to the file system via UEFI.
-    // locate_protocol finds the SimpleFileSystem service.
-    // This gives us access to the FAT32 partition.
+// ------------------------------------------------------------
+// Step 2 : Display boot banner
+// ------------------------------------------------------------
+
+/// Clears the screen and displays the KernOS boot banner.
+///
+/// Uses the UEFI text output protocol (stdout).
+/// Note : UEFI requires UTF-16 strings, hence the cstr16! macro.
+/// Note : UEFI requires \r\n (carriage return + line feed), not just \n.
+fn display_banner() {
+    uefi::system::with_stdout(|stdout| {
+        stdout.clear().unwrap();
+        stdout.output_string(cstr16!("============================================\r\n")).unwrap();
+        stdout.output_string(cstr16!("  KernOS v1.2.0\r\n")).unwrap();
+        stdout.output_string(cstr16!("  Bootloader starting...\r\n")).unwrap();
+        stdout.output_string(cstr16!("============================================\r\n")).unwrap();
+    });
+}
+
+// ------------------------------------------------------------
+// Step 3 : Load the kernel from disk
+// ------------------------------------------------------------
+
+/// Reads the kernel ELF file from the FAT32 partition into memory.
+///
+/// The kernel file must be located at the root of the EFI partition
+/// and named exactly "kernel.elf". This path is fixed by convention.
+///
+/// # How it works
+/// 1. Locate the UEFI SimpleFileSystem protocol (FAT32 access).
+/// 2. Open the root directory of the partition.
+/// 3. Open "kernel.elf" in read-only mode.
+/// 4. Read the file size from its metadata.
+/// 5. Allocate a memory buffer large enough to hold the file.
+/// 6. Read the entire file into that buffer.
+///
+/// # Returns
+/// A mutable byte slice containing the raw ELF file data.
+/// This slice is valid until we exit UEFI boot services.
+fn load_kernel_from_disk() -> &'static mut [u8] {
+
+    // Locate the handle that supports the SimpleFileSystem protocol.
+    // A handle is a UEFI identifier for a device or service.
+    // SimpleFileSystem is the UEFI interface for FAT32 volumes.
     let fs_handle = uefi::boot::get_handle_for_protocol::<SimpleFileSystem>().unwrap();
 
-    // We open the file system protocol on that handle
+    // Open the SimpleFileSystem protocol on that handle.
+    // exclusive means no other UEFI agent can use it at the same time.
     let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(fs_handle).unwrap();
 
-    // We open the root directory of the FAT32 partition
+    // Open the root directory of the FAT32 volume.
+    // This is the starting point for all file operations.
     let mut root = fs.open_volume().unwrap();
 
-    // We open the kernel file in read-only mode.
-    // The kernel must be at the root of the partition : \kernel.elf
-    // FileMode::Read = open for reading only.
-    // FileAttribute::empty() = no special attributes needed.
-    let kernel_file_handle = root
+    // Open "kernel.elf" at the root of the partition.
+    // FileMode::Read   = we only need to read, not write.
+    // FileAttribute::empty() = no special attributes required.
+    let kernel_handle = root
         .open(
             cstr16!("kernel.elf"),
             FileMode::Read,
             FileAttribute::empty(),
-        ).unwrap();
-    
-    // We convert the file handle to a RegularFile so we can read it.
-    // into_type() checks whether it is a file or a directory.
-    // We unwrap and match to get the RegularFile variant.
-    let mut kernel_file = match kernel_file_handle.into_type().unwrap() {
+        )
+        .unwrap();
+
+    // Convert the generic file handle into a RegularFile.
+    // UEFI treats files and directories the same way at first.
+    // into_type() lets us confirm this is a regular file, not a directory.
+    let mut kernel_file = match kernel_handle.into_type().unwrap() {
         FileType::Regular(f) => f,
         _ => panic!("kernel.elf is not a regular file"),
     };
 
-    // We need to know the file size before reading it.
-    // FileInfo contains metadata : name, size, timestamps...
-    // We allocate a buffer of 256 bytes to store this info.
+    // Read the file metadata to get the file size.
+    // FileInfo holds the name, size, and timestamps of the file.
+    // We pass a 256-byte buffer for UEFI to write the metadata into.
     let mut info_buffer = [0u8; 256];
     let info = kernel_file
         .get_info::<FileInfo>(&mut info_buffer)
         .unwrap();
 
-    // We get the file size in bytes.
+    // Extract the file size in bytes.
+    // We cast to usize because Rust uses usize for memory sizes.
     let kernel_size = info.file_size() as usize;
 
-    // We allocate a memory zone to store the raw kernel file content.
-    // allocate_pool asks UEFI for a contiguous block of memory.
-    // MemoryType::LOADER_DATA = this memory is used by the bootloader.
-    // kernel_size = we need exactly enough bytes to fit the whole file.
-    let kernel_buffer = uefi::boot::allocate_pool(
-        MemoryType::LOADER_DATA,
-        kernel_size,
-    ).unwrap();
+    // Allocate a pool of memory to hold the raw kernel file content.
+    // allocate_pool asks UEFI for a contiguous block of kernel_size bytes.
+    // MemoryType::LOADER_DATA marks this memory as "used by the bootloader".
+    // The kernel will later see this zone in the memory map and can reuse it.
+    let kernel_buffer = uefi::boot::allocate_pool(MemoryType::LOADER_DATA, kernel_size).unwrap();
 
-    // We create a mutable slice from the raw pointer.
-    // A slice is a Rust type that represents a contiguous block of memory
-    // with a known length. It lets us work with the buffer safely.
-    // unsafe is required becquse we are working with a raw pointer.
+    // Convert the raw pointer returned by allocate_pool into a Rust slice.
+    // A slice is a safe Rust view over a contiguous block of memory.
+    // It carries both the address and the length, so Rust can bounds-check it.
+    // unsafe is required because we are constructing a slice from a raw pointer.
+    // We trust UEFI to have returned a valid pointer of the correct size.
     let kernel_data = unsafe {
         core::slice::from_raw_parts_mut(kernel_buffer.as_ptr(), kernel_size)
     };
 
-    // We read the entire kernel file into our buffer.
+    // Read the entire kernel file into our allocated buffer.
     kernel_file.read(kernel_data).unwrap();
 
-    // Confirm that the kernel was loaded from disk successfully.
     uefi::system::with_stdout(|stdout| {
-        stdout.output_string(cstr16!("Kernel loaded from disk OK\r\n")).unwrap();
+        stdout
+            .output_string(cstr16!("[OK] Kernel loaded from disk\r\n"))
+            .unwrap();
     });
 
-    // -----------------------------------------------------
-    // STEP 4 : Parse the ELF file and load segments into memory
-    // -----------------------------------------------------
-    // The kernel.elf file is not just raw code.
-    // It contains headers that describe how to load it into memory
-    // We use xmas-elf to parse these headers.
+    // Return the buffer containing the raw ELF data.
+    // The caller will pass this to parse_and_load_elf().
+    kernel_data
+}
 
-    // We parse the ELF file from our buffer.
+// ------------------------------------------------------------
+// Step 4 : Parse the ELF file and load segments into memory
+// ------------------------------------------------------------
+
+/// Parses the kernel ELF binary and copies each loadable segment
+/// into its correct physical memory address.
+///
+/// # What is an ELF file ?
+/// ELF (Executable and Linkable Format) is the standard binary format
+/// for executables on Linux and bare-metal x86_64 systems.
+/// It contains :
+///   - A header  : architecture, entry point address, etc.
+///   - Segments  : blocks of code or data to load into memory.
+///   - Sections  : debug info, symbol tables (not needed here).
+///
+/// # What we do here
+/// 1. Parse the ELF header to validate the binary.
+/// 2. Iterate over all program headers (segment descriptors).
+/// 3. For each LOAD segment, copy its data to the correct RAM address.
+/// 4. Extract and return the kernel entry point address.
+///
+/// # Why only LOAD segments ?
+/// Only LOAD segments contain code or data that must be in RAM
+/// for the kernel to execute. Other types (NOTE, DYNAMIC, GNU_STACK)
+/// are metadata for tools and are not needed at runtime.
+///
+/// # Returns
+/// A raw function pointer to the kernel entry point.
+/// The bootloader will jump to this address in Step 7.
+fn parse_and_load_elf(kernel_data: &[u8]) -> *const () {
+
+    // Parse the raw bytes as an ELF file.
+    // ElfFile::new validates the ELF magic number (0x7F 'E' 'L' 'F')
+    // and checks that the architecture is x86_64.
     let elf = ElfFile::new(kernel_data).unwrap();
 
-    // We iterate over all program headers.
-    // Each program header describes one segment of the kernel.
-    // A segment is a contiguous block of code or data.
+    // Iterate over every program header in the ELF file.
+    // Each program header describes one segment.
     for segment in elf.program_iter() {
-        
-        // We only care about LOAD segments.
-        // LOAD segments are the ones that must be copied into memory.
-        // Other types (DYNAMIC, NOTE, etc.) are not relevant for us.
+
+        // Skip segments that are not of type LOAD.
+        // Only LOAD segments need to be copied into RAM.
         if segment.get_type().unwrap() != Type::Load {
             continue;
         }
 
-        // Where in memory should this segment be place ?
-        // physical_addr() gives us the target address in RAM.
+        // Get the target physical address for this segment.
+        // This is where in RAM we must copy the segment data.
+        // The ELF linker script determines these addresses.
         let phys_addr = segment.physical_addr() as *mut u8;
 
-        // What is the raw data of this segment in the ELF file ?
+        // Get the raw bytes of this segment from the ELF file.
+        // SegmentData::Undefined is the variant for raw binary data,
+        // which is what code and initialized data segments contain.
         let data = match segment.get_data(&elf).unwrap() {
             SegmentData::Undefined(data) => data,
             _ => continue,
         };
 
-        // We copy the segment data to the correct memory address.
-        // unsafe is required because we are writing to a raw pointer.
-        // copy_nonoverlapping is like memcpy in C.
-        // It copies bytes from the ELF file into the target RAM address.
+        // Copy the segment bytes to the target RAM address.
+        // copy_nonoverlapping is equivalent to memcpy in C.
+        // It requires unsafe because we write to a raw pointer.
+        // We trust the ELF linker script to have placed segments
+        // at valid, non-overlapping memory addresses.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 data.as_ptr(),
@@ -177,89 +276,136 @@ fn main() -> Status {
         }
     }
 
-    // Confirm that ELF segments were loaded successfully.
     uefi::system::with_stdout(|stdout| {
-        stdout.output_string(cstr16!("Kernel ELF segments loaded OK.\r\n")).unwrap()
+        stdout
+            .output_string(cstr16!("[OK] Kernel ELF segments loaded\r\n"))
+            .unwrap();
     });
 
-    // We get the kernel entry point address from the ELF header.
-    // This is the address where we will jump to start the kernel.
-    let entry_point = elf.header.pt2.entry_point() as *const ();
-
-    // -----------------------------------------------------
-    // STEP 5 : Get the memory map
-    // -----------------------------------------------------
-    // We must do this right before exiting UEFI boot services.
-    // The memory map must be as up to date as possible.
-    // The memory map is the list of ALL memory zones in the computer.
-    // Each zone has a type : free, used by firmware, reserved by hardware...
-    // We need this list because the kernel will need to know which memory
-    // zones are free to use, and which ones to avoid.
-    // We must get this before we exit UEFI boot services (Step 4), because 
-    // after that, we can no longer ask the firmware for anything.
-
-    // MemoryType::LOADER_DATA tells UEFI : "store the memory map itself in
-    // a zone of type LOADER_DATA". This type means "data used by the bootloader".
-    // The kernel will know to look there.
-    let _memory_map = uefi::boot::memory_map(MemoryType::LOADER_DATA).unwrap();
-    
-    // Just to confirm that the memory map was retrieved successfully.
-    // This is the last thing we display via UEFI services.
-    // After Step 4, we no longer have access to the screen this way.
-    uefi::system::with_stdout(|stdout| {
-        stdout.output_string(cstr16!("Memory map OK !\r\n")).unwrap();
-        stdout.output_string(cstr16!("Now exiting UEFI boot services...\r\n")).unwrap();
-    });
-
-    // -----------------------------------------------------
-    // STEP 6 : Exit UEFI boot services
-    // -----------------------------------------------------
-    // This is the point of no return.
-    // We tell the firmware "thank you, you can leave now."
-    // After this line :
-    // - No more access to UEFI screen services
-    // - No more access to UEFI memory services
-    // - The CPU belongs entirely to us
-    // - The kernel takes full control
-    //
-    // exit_boot_services() needs the memory map we got in Step 3.
-    // It uses it to know exactly what memory it can free up when
-    // the firmware shuts down its own services.
-    //
-    // The underscore bebofre memory_map tells Rust "I know this
-    // variable exists but I don't use it yet."
-    // We will use it in Step 5 to pass it to the kernel.
-    let _memory_map = unsafe { uefi::boot::exit_boot_services(MemoryType::LOADER_DATA) };
-
-    // -----------------------------------------------------
-    // Step 7 : Jump to the kernel
-    // -----------------------------------------------------
-    // We convert the entry point address into a function pointer.
-    // A function pointer is a variable that contains the address
-    // of a function in memory. We can then call it like a normal function.
-    //
-    // unsafe is required because we are calling a raw function pointer
-    // The compiler has no way to verify that this address is valid.
-    // We trust the ELF header to give us the correct entry point.
-    unsafe {
-        let kernel_entry: extern "C" fn() -> ! = 
-            core::mem::transmute(entry_point);
-        
-        // We call the kernel entry point.
-        // This transfers control to the kernel permanently.
-        // The bootloader never gets control back after this line.
-        kernel_entry();
-    }
-
+    // Extract the kernel entry point from the ELF header.
+    // This is the virtual address of the first instruction to execute.
+    // We cast it to a raw function pointer for use in jump_to_kernel().
+    elf.header.pt2.entry_point() as *const ()
 }
 
-// -----------------------------------------------------
-// PANIC HANDLER
-// -----------------------------------------------------
-// In no_std mode, Rust requires us to define what happens
-// when the program panics (crashes).
-// Here we simply loop forever.
-// Later we could display an error message on screen.
+// ------------------------------------------------------------
+// Step 5 : Retrieve the memory map
+// ------------------------------------------------------------
+
+/// Asks the UEFI firmware for the current system memory map.
+///
+/// The memory map is a list of all physical memory zones, each described
+/// by a type (free, used by firmware, reserved by hardware, etc.).
+///
+/// The kernel needs this map to know which memory zones it can use
+/// and which ones it must avoid.
+///
+/// # Timing
+/// This must be called as late as possible, right before exiting
+/// UEFI boot services. The memory map changes every time UEFI
+/// allocates or frees memory, so an early snapshot would be stale.
+///
+/// After exit_boot_services(), we can no longer call this function.
+fn get_memory_map() {
+    // Request the memory map from UEFI.
+    // MemoryType::LOADER_DATA tells UEFI to allocate the map buffer
+    // in a LOADER_DATA zone, so the kernel can find and reuse it.
+    // We prefix with _ to silence the unused variable warning.
+    // The map is consumed internally by exit_boot_services().
+    let _memory_map = uefi::boot::memory_map(MemoryType::LOADER_DATA).unwrap();
+
+    uefi::system::with_stdout(|stdout| {
+        stdout
+            .output_string(cstr16!("[OK] Memory map retrieved\r\n"))
+            .unwrap();
+    });
+}
+
+// ------------------------------------------------------------
+// Step 6 : Exit UEFI boot services
+// ------------------------------------------------------------
+
+/// Transfers full control of the machine from UEFI to our kernel.
+///
+/// This is the point of no return. After this function :
+///   - All UEFI services are gone (no screen, no disk, no memory services).
+///   - The UEFI firmware frees its own memory zones.
+///   - The CPU belongs entirely to the kernel.
+///
+/// # Why is this unsafe ?
+/// exit_boot_services() causes the firmware to free its own memory.
+/// Pointers that were valid one moment before may become invalid instantly.
+/// The Rust compiler cannot verify this, so we must use unsafe
+/// and take full responsibility for correctness.
+fn exit_boot_services() {
+    uefi::system::with_stdout(|stdout| {
+        stdout
+            .output_string(cstr16!("Exiting UEFI boot services...\r\n"))
+            .unwrap();
+    });
+
+    // Exit UEFI boot services.
+    // After this line, no UEFI call is valid anymore.
+    // MemoryType::LOADER_DATA tells UEFI where to store the final
+    // memory map that describes what it freed when shutting down.
+    let _final_memory_map = unsafe {
+        uefi::boot::exit_boot_services(MemoryType::LOADER_DATA)
+    };
+}
+
+// ------------------------------------------------------------
+// Step 7 : Jump to the kernel entry point
+// ------------------------------------------------------------
+
+/// Transfers execution to the kernel by calling its entry point.
+///
+/// This function never returns. Once the kernel starts, the bootloader
+/// is gone. The kernel takes full and permanent control of the machine.
+///
+/// # How it works
+/// The entry point is a raw memory address obtained from the ELF header.
+/// We cast it to a Rust function pointer and call it.
+/// The "C" ABI ensures the call follows the standard x86_64 calling
+/// convention that the kernel expects.
+///
+/// # Why is this unsafe ?
+/// We are calling a raw function pointer. The compiler has no way
+/// to verify that this address is valid or that the function signature
+/// matches. We trust the ELF parser to have given us the correct address.
+///
+/// # Why -> ! ?
+/// The ! return type means "this function never returns".
+/// Rust requires this here because main() must return a Status,
+/// but after jumping to the kernel, we never come back.
+fn jump_to_kernel(entry_point: *const ()) -> ! {
+    unsafe {
+        // Cast the raw address to a callable function pointer.
+        // extern "C" = use the standard C calling convention (ABI).
+        // fn() -> !  = a function that takes no arguments and never returns.
+        let kernel_entry: extern "C" fn() -> ! =
+            core::mem::transmute(entry_point);
+
+        // Call the kernel entry point.
+        // This transfers control permanently to the kernel.
+        // The bootloader never executes another instruction after this.
+        kernel_entry()
+    }
+}
+
+// ------------------------------------------------------------
+// Panic Handler
+// ------------------------------------------------------------
+
+/// Called automatically by Rust if the program panics.
+///
+/// A panic occurs when an unwrap() fails or when the program
+/// reaches an explicitly unreachable state.
+///
+/// In no_std mode, Rust requires us to define this handler ourselves
+/// because the standard library's panic handler is not available.
+///
+/// Currently we loop forever. A future improvement would be to
+/// display the panic message on screen before halting.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

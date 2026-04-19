@@ -6,7 +6,7 @@
 name = "bootloader"
 
 # Current version. We follow semantic versioning : major.minor.patch
-version = "0.1.0"
+version = "1.2.0"
 
 # The Rust edition defines which version of the Rust syntax we use.
 # 2021 is the current stable edition. Do not use 2024 as it still unstable.
@@ -24,3 +24,4 @@ uefi = "0.33"
 # where to load each piece of the kernel in memory.
 # It works in no_std mode, which is required for a bootloader.
 xmas-elf = "0.10.0"
+

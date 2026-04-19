@@ -1,18 +1,72 @@
+# ============================================================
+# KernOS Build System
+# ============================================================
+#
+# Available commands :
+#   make build   - compile bootloader and kernel
+#   make run     - compile and launch in QEMU
+#   make clean   - delete all compiled files
+# ============================================================
+
+# Path to the UEFI firmware used by QEMU.
 OVMF := /usr/share/OVMF/OVMF_CODE_4M.fd
+
+# Path to the final disk image.
 IMG := target/kernos.img
+
+# Path to the compiled bootloader.
 EFI := target/x86_64-unknown-uefi/release/bootloader.efi
 
+# Path to the compiled kernel.
+KERNEL := target/x86_64-unknown-none/release/kernel
+
+# All targets listed here are commands.
+# Without .PHONY, make would look for files named build, run, clean.
 .PHONY: build run clean
 
+# ------------------------------------------------------------
+# build : compile bootloader and kernel
+# ------------------------------------------------------------
 build:
-	cargo +nightly build --release
+	@echo "[KernOS] Compiling bootloader..."
+	cargo +nightly build -p bootloader --release --target x86_64-unknown-uefi
 
+	@echo "[KernOS] Compiling kernel..."
+	cargo +nightly build -p kernel --release --target x86_64-unknown-none
+
+	@echo "[KernOS] Build complete."
+	
+
+# ------------------------------------------------------------
+# run : build then launch in QEMU
+# ------------------------------------------------------------
 run: build
+	@echo "[KernOS] Building disk image..."
+	
+	# Create the UEFI directory structure
+	# The UEFI firmware always look for the bootloader at EFI/BOOT/BOOTX64.EFI.
 	mkdir -p target/esp/EFI/BOOT
+
+	# Copy the bootloader to the correct UEFI path.
 	cp $(EFI) target/esp/EFI/BOOT/BOOTX64.EFI
+
+	# Copy the kernel to the root of the partition.
+	# The bootloader looks for "kernel.elf" at the root.
+	cp $(KERNEL) target/esp/kernel.elf
+
+	# Create a blank 64 MB raw disk image.
 	dd if=/dev/zero of=$(IMG) bs=1M count=64 2>/dev/null
+
+	# Format the disk image as FAT32.
+	# UEFI requires FAT32 for the EFI system partition.
 	mkfs.fat -F 32 $(IMG) > /dev/null
+
+	# Copy our files into the FAT32 image.
+	# mcopy works without root privileges, unlike mount.
 	mcopy -i $(IMG) -s target/esp/EFI ::EFI
+	mcopy -i $(IMG) target/esp/kernel.elf ::kernel.elf
+
+	@echo "[KernOS] Launching QEMU..."
 	qemu-system-x86_64 \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 		-drive format=raw,file=$(IMG) \
@@ -20,6 +74,12 @@ run: build
 		-name "KernOS" \
 		-nographic
 
+
+# ------------------------------------------------------------
+# clean : delete all compiled output
+# ------------------------------------------------------------
 clean:
+	@echo "[KernOS] Cleaning..."
 	cargo clean
 	rm -rf target/esp $(IMG)
+	@echo "[KernOS] Done."
