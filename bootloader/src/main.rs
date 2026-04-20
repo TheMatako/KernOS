@@ -22,7 +22,6 @@
 // The standard library assumes an OS exists underneath.
 // Since we ARE the OS, nothing exists beneath us yet.
 #![no_std]
-
 // We disable the automatic main() entry point.
 // UEFI has its own entry point convention, handled by the #[entry] macro below.
 #![no_main]
@@ -101,10 +100,18 @@ fn init_uefi() {
 fn display_banner() {
     uefi::system::with_stdout(|stdout| {
         stdout.clear().unwrap();
-        stdout.output_string(cstr16!("============================================\r\n")).unwrap();
-        stdout.output_string(cstr16!("  KernOS v1.2.0\r\n")).unwrap();
-        stdout.output_string(cstr16!("  Bootloader starting...\r\n")).unwrap();
-        stdout.output_string(cstr16!("============================================\r\n")).unwrap();
+        stdout
+            .output_string(cstr16!("============================================\r\n"))
+            .unwrap();
+        stdout
+            .output_string(cstr16!("  KernOS v1.2.0\r\n"))
+            .unwrap();
+        stdout
+            .output_string(cstr16!("  Bootloader starting...\r\n"))
+            .unwrap();
+        stdout
+            .output_string(cstr16!("============================================\r\n"))
+            .unwrap();
     });
 }
 
@@ -129,7 +136,6 @@ fn display_banner() {
 /// A mutable byte slice containing the raw ELF file data.
 /// This slice is valid until we exit UEFI boot services.
 fn load_kernel_from_disk() -> &'static mut [u8] {
-
     // Locate the handle that supports the SimpleFileSystem protocol.
     // A handle is a UEFI identifier for a device or service.
     // SimpleFileSystem is the UEFI interface for FAT32 volumes.
@@ -166,9 +172,7 @@ fn load_kernel_from_disk() -> &'static mut [u8] {
     // FileInfo holds the name, size, and timestamps of the file.
     // We pass a 256-byte buffer for UEFI to write the metadata into.
     let mut info_buffer = [0u8; 256];
-    let info = kernel_file
-        .get_info::<FileInfo>(&mut info_buffer)
-        .unwrap();
+    let info = kernel_file.get_info::<FileInfo>(&mut info_buffer).unwrap();
 
     // Extract the file size in bytes.
     // We cast to usize because Rust uses usize for memory sizes.
@@ -185,9 +189,8 @@ fn load_kernel_from_disk() -> &'static mut [u8] {
     // It carries both the address and the length, so Rust can bounds-check it.
     // unsafe is required because we are constructing a slice from a raw pointer.
     // We trust UEFI to have returned a valid pointer of the correct size.
-    let kernel_data = unsafe {
-        core::slice::from_raw_parts_mut(kernel_buffer.as_ptr(), kernel_size)
-    };
+    let kernel_data =
+        unsafe { core::slice::from_raw_parts_mut(kernel_buffer.as_ptr(), kernel_size) };
 
     // Read the entire kernel file into our allocated buffer.
     kernel_file.read(kernel_data).unwrap();
@@ -233,7 +236,6 @@ fn load_kernel_from_disk() -> &'static mut [u8] {
 /// A raw function pointer to the kernel entry point.
 /// The bootloader will jump to this address in Step 7.
 fn parse_and_load_elf(kernel_data: &[u8]) -> *const () {
-
     // Parse the raw bytes as an ELF file.
     // ElfFile::new validates the ELF magic number (0x7F 'E' 'L' 'F')
     // and checks that the architecture is x86_64.
@@ -242,7 +244,6 @@ fn parse_and_load_elf(kernel_data: &[u8]) -> *const () {
     // Iterate over every program header in the ELF file.
     // Each program header describes one segment.
     for segment in elf.program_iter() {
-
         // Skip segments that are not of type LOAD.
         // Only LOAD segments need to be copied into RAM.
         if segment.get_type().unwrap() != Type::Load {
@@ -268,11 +269,7 @@ fn parse_and_load_elf(kernel_data: &[u8]) -> *const () {
         // We trust the ELF linker script to have placed segments
         // at valid, non-overlapping memory addresses.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                phys_addr,
-                data.len(),
-            );
+            core::ptr::copy_nonoverlapping(data.as_ptr(), phys_addr, data.len());
         }
     }
 
@@ -348,9 +345,7 @@ fn exit_boot_services() {
     // After this line, no UEFI call is valid anymore.
     // MemoryType::LOADER_DATA tells UEFI where to store the final
     // memory map that describes what it freed when shutting down.
-    let _final_memory_map = unsafe {
-        uefi::boot::exit_boot_services(MemoryType::LOADER_DATA)
-    };
+    let _final_memory_map = unsafe { uefi::boot::exit_boot_services(MemoryType::LOADER_DATA) };
 }
 
 // ------------------------------------------------------------
@@ -382,8 +377,7 @@ fn jump_to_kernel(entry_point: *const ()) -> ! {
         // Cast the raw address to a callable function pointer.
         // extern "C" = use the standard C calling convention (ABI).
         // fn() -> !  = a function that takes no arguments and never returns.
-        let kernel_entry: extern "C" fn() -> ! =
-            core::mem::transmute(entry_point);
+        let kernel_entry: extern "C" fn() -> ! = core::mem::transmute(entry_point);
 
         // Call the kernel entry point.
         // This transfers control permanently to the kernel.

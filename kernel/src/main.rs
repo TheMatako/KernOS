@@ -15,10 +15,8 @@
 
 // No standard library - there is no OS beneath the kernel.
 #![no_std]
-
 // No automatic entry point - we define our own below
 #![no_main]
-
 
 // ------------------------------------------------------------
 // Kernel Entry Point
@@ -36,7 +34,7 @@
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     // TODO : Brick 1 - initialize the kernel environment
-    loop {}
+    panic!()
 }
 
 // ------------------------------------------------------------
