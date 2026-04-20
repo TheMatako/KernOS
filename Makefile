@@ -22,7 +22,7 @@ KERNEL := target/x86_64-unknown-none/release/kernel
 
 # All targets listed here are commands.
 # Without .PHONY, make would look for files named build, run, clean.
-.PHONY: build run clean
+.PHONY: build run clean fmt lint
 
 # ------------------------------------------------------------
 # build : compile bootloader and kernel
@@ -83,3 +83,27 @@ clean:
 	cargo clean
 	rm -rf target/esp $(IMG)
 	@echo "[KernOS] Done."
+
+# ------------------------------------------------------------
+# fmt : format all code
+# ------------------------------------------------------------
+fmt:
+	@echo "[KernOS] Formatting code..."
+	cargo +nightly fmt
+	@echo "[KernOS] Done."
+
+# ------------------------------------------------------------
+# lint : run clippy on all crates
+# ------------------------------------------------------------
+lint:
+	@echo "[KernOS] Running clippy on bootloader..."
+	cargo +nightly clippy \
+		-p bootloader \
+		--target x86_64-unknown-uefi \
+		-- -D warnings
+
+	@echo "[KernOS] Running clippy on kernel..."
+	cargo +nightly clippy \
+		-p kernel \
+		--target x86_64-unknown-none \
+		-- -D warnings

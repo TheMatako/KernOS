@@ -1,0 +1,141 @@
+# ============================================================
+# KernOS CI Pipeline
+# ============================================================
+#
+# This workflow runs automatically on every push and pull request.
+# It ensures that :
+#   1. The bootloader compiles without errors
+#   2. The kernel compiles without errors
+#   3. The code follows Rust style conventions
+#
+# If any of these checks fail, the pull request cannot be merged.
+# ============================================================
+
+name: CI
+
+# Run this workflow on every push to any branch,
+# and on every pull request targeting main.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ------------------------------------------------------------
+  # Job 1 : Build
+  # Compiles the bootloader and kernel to catch any errors.
+  # ------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      # Download the repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Install Rust nightly with the required targets
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-uefi,x86_64-unknown-none
+          components: rust-src
+
+      # Cache compiled dependencies to speed up future runs
+      # Without this, every run recompiles everything from scratch
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Install system dependencies needed for the build
+      - name: Install system dependencies
+        run: sudo apt-get install -y lld mtools
+
+      # Compile the bootloader
+      - name: Build bootloader
+        run: |
+          cargo +nightly build \
+            -p bootloader \
+            --release \
+            --target x86_64-unknown-uefi
+
+      # Compile the kernel
+      - name: Build kernel
+        run: |
+          cargo +nightly build \
+            -p kernel \
+            --release \
+            --target x86_64-unknown-none
+
+  # ------------------------------------------------------------
+  # Job 2 : Format check
+  # Verifies that all code follows Rust style conventions.
+  # rustfmt is the official Rust code formatter.
+  # ------------------------------------------------------------
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      # Check bootloader formatting
+      - name: Check bootloader formatting
+        run: cargo fmt -p bootloader -- --check
+
+      # Check kernel formatting
+      - name: Check kernel formatting
+        run: cargo fmt -p kernel -- --check
+
+  # ------------------------------------------------------------
+  # Job 3 : Clippy
+  # Clippy is the official Rust linter.
+  # It catches common mistakes and suggests improvements.
+  # ------------------------------------------------------------
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-uefi,x86_64-unknown-none
+          components: rust-src,clippy
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y lld
+
+      # Run clippy on the bootloader
+      - name: Clippy bootloader
+        run: |
+          cargo +nightly clippy \
+            -p bootloader \
+            --target x86_64-unknown-uefi \
+            -- -D warnings
+
+      # Run clippy on the kernel
+      - name: Clippy kernel
+        run: |
+          cargo +nightly clippy \
+            -p kernel \
+            --target x86_64-unknown-none \
+            -- -D warnings
