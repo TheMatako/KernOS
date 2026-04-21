@@ -22,7 +22,7 @@ KERNEL := target/x86_64-unknown-none/release/kernel
 
 # All targets listed here are commands.
 # Without .PHONY, make would look for files named build, run, clean.
-.PHONY: build run clean fmt lint
+.PHONY: build run clean fmt lint pxe-update
 
 # ------------------------------------------------------------
 # build : compile bootloader and kernel
@@ -107,3 +107,13 @@ lint:
 		-p kernel \
 		--target x86_64-unknown-none \
 		-- -D warnings
+
+# ------------------------------------------------------------
+# pxe-update : copy bootloader and kernel to TFTP server
+# ------------------------------------------------------------
+pxe-update: build
+	@echo "[KernOS] Updating PXE TFTP files..."
+	sudo cp $(EFI) /srv/tftp/bootx64.efi
+	sudo cp $(KERNEL) /srv/tftp/kernel.elf
+	sudo chmod 644 /srv/tftp/bootx64.efi /srv/tftp/kernel.elf
+	@echo "[KernOS] PXE files updated."
