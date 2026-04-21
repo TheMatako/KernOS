@@ -67,7 +67,7 @@ fn main() -> Status {
     init_uefi();
     display_banner();
 
-    let kernel_data = load_kernel_from_disk();
+    let kernel_data = load_kernel();
     let entry_point = parse_and_load_elf(kernel_data);
 
     get_memory_map();
@@ -119,6 +119,7 @@ fn display_banner() {
 // Step 3 : Load the kernel from disk
 // ------------------------------------------------------------
 
+/// # First version explaination here :
 /// Reads the kernel ELF file from the FAT32 partition into memory.
 ///
 /// The kernel file must be located at the root of the EFI partition
@@ -135,65 +136,66 @@ fn display_banner() {
 /// # Returns
 /// A mutable byte slice containing the raw ELF file data.
 /// This slice is valid until we exit UEFI boot services.
-fn load_kernel_from_disk() -> &'static mut [u8] {
-    // Locate the handle that supports the SimpleFileSystem protocol.
-    // A handle is a UEFI identifier for a device or service.
-    // SimpleFileSystem is the UEFI interface for FAT32 volumes.
-    let fs_handle = uefi::boot::get_handle_for_protocol::<SimpleFileSystem>().unwrap();
+///
+/// # New Version explaination here :
+/// Loads the kernel into memory.
+///
+/// Tries two methods in order :
+/// 1. SimpleFileSystem — works in QEMU and when a FAT32 disk is present.
+/// 2. PXE TFTP download — works when booted over the network.
+///
+/// # Returns
+/// A mutable byte slice containing the raw ELF file data.
+fn load_kernel() -> &'static mut [u8] {
+    // First attempt : try to load from a FAT32 filesystem.
+    // This works in QEMU (disk image) and on real hardware with a FAT32 partition.
+    if let Some(data) = try_load_from_disk() {
+        return data;
+    }
 
-    // Open the SimpleFileSystem protocol on that handle.
-    // exclusive means no other UEFI agent can use it at the same time.
-    let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(fs_handle).unwrap();
+    // Second attempt : try to download via PXE TFTP.
+    // This works when the machine booted over the network.
+    if let Some(data) = try_load_via_pxe() {
+        return data;
+    }
 
-    // Open the root directory of the FAT32 volume.
-    // This is the starting point for all file operations.
-    let mut root = fs.open_volume().unwrap();
+    // Both methods failed — we cannot continue.
+    panic!("Failed to load kernel.elf — no disk and no PXE available");
+}
 
-    // Open "kernel.elf" at the root of the partition.
-    // FileMode::Read   = we only need to read, not write.
-    // FileAttribute::empty() = no special attributes required.
+/// Attempts to load kernel.elf from a FAT32 filesystem.
+/// Returns None if no filesystem is available or the file is not found.
+fn try_load_from_disk() -> Option<&'static mut [u8]> {
+    // Try to find a SimpleFileSystem handle.
+    // This fails if there is no FAT32 partition accessible.
+    let fs_handle = uefi::boot::get_handle_for_protocol::<SimpleFileSystem>().ok()?;
+
+    let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(fs_handle).ok()?;
+    let mut root = fs.open_volume().ok()?;
+
     let kernel_handle = root
         .open(
             cstr16!("kernel.elf"),
             FileMode::Read,
             FileAttribute::empty(),
         )
-        .unwrap();
+        .ok()?;
 
-    // Convert the generic file handle into a RegularFile.
-    // UEFI treats files and directories the same way at first.
-    // into_type() lets us confirm this is a regular file, not a directory.
-    let mut kernel_file = match kernel_handle.into_type().unwrap() {
+    let mut kernel_file = match kernel_handle.into_type().ok()? {
         FileType::Regular(f) => f,
-        _ => panic!("kernel.elf is not a regular file"),
+        _ => return None,
     };
 
-    // Read the file metadata to get the file size.
-    // FileInfo holds the name, size, and timestamps of the file.
-    // We pass a 256-byte buffer for UEFI to write the metadata into.
     let mut info_buffer = [0u8; 256];
-    let info = kernel_file.get_info::<FileInfo>(&mut info_buffer).unwrap();
-
-    // Extract the file size in bytes.
-    // We cast to usize because Rust uses usize for memory sizes.
+    let info = kernel_file.get_info::<FileInfo>(&mut info_buffer).ok()?;
     let kernel_size = info.file_size() as usize;
 
-    // Allocate a pool of memory to hold the raw kernel file content.
-    // allocate_pool asks UEFI for a contiguous block of kernel_size bytes.
-    // MemoryType::LOADER_DATA marks this memory as "used by the bootloader".
-    // The kernel will later see this zone in the memory map and can reuse it.
-    let kernel_buffer = uefi::boot::allocate_pool(MemoryType::LOADER_DATA, kernel_size).unwrap();
+    let kernel_buffer = uefi::boot::allocate_pool(MemoryType::LOADER_DATA, kernel_size).ok()?;
 
-    // Convert the raw pointer returned by allocate_pool into a Rust slice.
-    // A slice is a safe Rust view over a contiguous block of memory.
-    // It carries both the address and the length, so Rust can bounds-check it.
-    // unsafe is required because we are constructing a slice from a raw pointer.
-    // We trust UEFI to have returned a valid pointer of the correct size.
     let kernel_data =
         unsafe { core::slice::from_raw_parts_mut(kernel_buffer.as_ptr(), kernel_size) };
 
-    // Read the entire kernel file into our allocated buffer.
-    kernel_file.read(kernel_data).unwrap();
+    kernel_file.read(kernel_data).ok()?;
 
     uefi::system::with_stdout(|stdout| {
         stdout
@@ -201,9 +203,44 @@ fn load_kernel_from_disk() -> &'static mut [u8] {
             .unwrap();
     });
 
-    // Return the buffer containing the raw ELF data.
-    // The caller will pass this to parse_and_load_elf().
-    kernel_data
+    Some(kernel_data)
+}
+
+/// Attempts to download kernel.elf from the PXE TFTP server.
+/// Returns None if PXE is not available.
+fn try_load_via_pxe() -> Option<&'static mut [u8]> {
+    use uefi::proto::network::pxe::BaseCode;
+    use uefi::proto::network::IpAddress;
+
+    let pxe_handle = uefi::boot::get_handle_for_protocol::<BaseCode>().ok()?;
+    let mut pxe = uefi::boot::open_protocol_exclusive::<BaseCode>(pxe_handle).ok()?;
+
+    // Hardcode the TFTP server IP.
+    // In our lab setup, the PXE server is always the VM at 192.168.100.1.
+    // This avoids having to parse the private DHCP packet fields.
+    let server_ip = IpAddress::new_v4([192, 168, 100, 1]);
+
+    let file_size: u64 = match pxe.tftp_get_file_size(&server_ip, cstr8!("kernel.elf")) {
+        Ok(size) => size,
+        Err(_) => return None,
+    };
+    let kernel_size = file_size as usize;
+
+    let kernel_buffer = uefi::boot::allocate_pool(MemoryType::LOADER_DATA, kernel_size).ok()?;
+
+    let kernel_data =
+        unsafe { core::slice::from_raw_parts_mut(kernel_buffer.as_ptr(), kernel_size) };
+
+    pxe.tftp_read_file(&server_ip, cstr8!("kernel.elf"), Some(kernel_data))
+        .ok()?;
+
+    uefi::system::with_stdout(|stdout| {
+        stdout
+            .output_string(cstr16!("[OK] Kernel loaded via PXE TFTP\r\n"))
+            .unwrap();
+    });
+
+    Some(kernel_data)
 }
 
 // ------------------------------------------------------------
@@ -402,5 +439,8 @@ fn jump_to_kernel(entry_point: *const ()) -> ! {
 /// display the panic message on screen before halting.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
+    uefi::system::with_stdout(|stdout| {
+        stdout.output_string(cstr16!("Problem...\r\n")).unwrap();
+    });
     loop {}
 }
