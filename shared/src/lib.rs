@@ -79,6 +79,11 @@ pub struct MemoryMap {
     /// Number of valid entries in the array.
     pub entry_count: usize,
 }
+impl Default for MemoryMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MemoryMap {
     /// Creates an empty memory map with no valid entries.
@@ -169,6 +174,12 @@ pub struct BootInfo {
     /// Physical address of the ACPI RSDP table.
     /// None if ACPI is not available on this machine.
     pub rsdp_address: Option<u64>,
+}
+
+impl Default for BootInfo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BootInfo {
