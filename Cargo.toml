@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bootloader", "kernel"]
+members = ["bootloader", "kernel", "shared"]
 
 
 # Tell the compiler to abort immediately on panic instead of unwinding.

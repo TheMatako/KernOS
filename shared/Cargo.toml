@@ -1,0 +1,11 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+# This is a library crate - It produces no executable.
+# Both bootloader and kernel depend on it.
+[lib]
+name = "shared"
+path = "src/lib.rs"
+[dependencies]

@@ -6,84 +6,135 @@
 // It is loaded by the UEFI firmware and is responsible for :
 //
 //   1. Initializing UEFI services
-//   2. Displaying a boot message
-//   3. Loading the kernel from disk
-//   4. Parsing the kernel ELF file and mapping it into memory
-//   5. Retrieving the system memory map
-//   6. Exiting UEFI boot services
-//   7. Jumping to the kernel entry point
+//   2. Displaying a boot banner
+//   3. Loading the kernel from disk or via PXE TFTP
+//   4. Parsing the kernel ELF and mapping segments into memory
+//   5. Collecting framebuffer and ACPI information
+//   6. Retrieving the UEFI memory map
+//   7. Exiting UEFI boot services
+//   8. Converting the UEFI memory map into our BootInfo format
+//   9. Jumping to kernel_main() with a pointer to BootInfo
 //
-// Language  : Rust (no_std, no_main)
-// Target    : x86_64-unknown-uefi
-// Author    : Matéo Reymond (AI assisted)
+// Language : Rust (no_std, no_main)
+// Target   : x86_64-unknown-uefi
+// Author   : Matéo Reymond (AI assisted)
 // ============================================================
 
-// We disable the Rust standard library.
-// The standard library assumes an OS exists underneath.
-// Since we ARE the OS, nothing exists beneath us yet.
 #![no_std]
-// We disable the automatic main() entry point.
-// UEFI has its own entry point convention, handled by the #[entry] macro below.
 #![no_main]
 
 // ------------------------------------------------------------
 // Imports
 // ------------------------------------------------------------
 
-// Core UEFI types : Handle, Status, SystemTable, Boot.
-// These are the fundamental building blocks of any UEFI application.
-use uefi::prelude::*;
-
-// MemoryType classifies memory zones.
-// Example : LOADER_DATA = memory used by the bootloader.
+use shared::{BootInfo, FramebufferInfo, MemoryRegion, MemoryRegionKind};
 use uefi::boot::MemoryType;
-
-// File system types for reading files from the FAT32 partition.
-// SimpleFileSystem = the UEFI protocol to access a FAT32 volume.
-// File             = base trait for file and directory operations.
-// FileMode         = read, write, or create.
-// FileAttribute    = file attributes (hidden, read-only, etc.).
-// FileType         = regular file or directory.
-// FileInfo         = file metadata (name, size, timestamps).
+use uefi::mem::memory_map::MemoryMap as UefiMemoryMap;
+use uefi::prelude::*;
 use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode, FileType};
 use uefi::proto::media::fs::SimpleFileSystem;
-
-// ELF parser types.
-// ElfFile    = the parsed representation of an ELF binary.
-// Type       = segment type (LOAD, DYNAMIC, NOTE, etc.).
-// SegmentData = the raw data contained in an ELF segment.
 use xmas_elf::program::{SegmentData, Type};
 use xmas_elf::ElfFile;
 
 // ------------------------------------------------------------
-// Entry Point
+// Entry point
 // ------------------------------------------------------------
 
-// #[entry] marks this function as the UEFI entry point.
-// The firmware calls this function after loading our .efi file.
-// It replaces the classic fn main() used in normal Rust programs.
 #[entry]
 fn main() -> Status {
     init_uefi();
     display_banner();
 
+    // Create the BootInfo structure that we will pass to the kernel.
+    // It starts empty and gets filled step by step below.
+    let mut boot_info = BootInfo::new();
+
+    // Load the kernel binary into memory from disk or via PXE.
     let kernel_data = load_kernel();
-    let entry_point = parse_and_load_elf(kernel_data);
 
-    get_memory_map();
-    exit_boot_services();
-    jump_to_kernel(entry_point);
+    // Parse the ELF file, copy segments into RAM, and record
+    // the kernel's physical location in boot_info.
+    let entry_point = parse_and_load_elf(kernel_data, &mut boot_info);
+
+    // Collect GOP framebuffer address and dimensions.
+    fill_framebuffer_info(&mut boot_info);
+
+    // Collect the ACPI RSDP address for later hardware initialization.
+    fill_rsdp_info(&mut boot_info);
+
+    // Get the UEFI memory map right before exiting boot services.
+    // We let Rust infer the concrete type — it is not publicly exposed.
+    // This must be done as late as possible since the map changes
+    // every time UEFI allocates or frees memory.
+    let uefi_memory_map = uefi::boot::memory_map(MemoryType::LOADER_DATA).unwrap();
+
+    uefi::system::with_stdout(|stdout| {
+        stdout
+            .output_string(cstr16!("[OK] Memory map retrieved\r\n"))
+            .unwrap();
+        stdout
+            .output_string(cstr16!("Exiting UEFI boot services...\r\n"))
+            .unwrap();
+    });
+
+    // Point of no return — all UEFI services are gone after this line.
+    // No more screen output, no more disk access, no more memory services.
+    // The CPU belongs entirely to us.
+    unsafe {
+        let _ = uefi::boot::exit_boot_services(MemoryType::LOADER_DATA);
+    };
+
+    // Convert the UEFI memory map into our own BootInfo format.
+    // We do this AFTER exit_boot_services() because the map is now
+    // stable — no more allocations or frees will change it.
+    //
+    // entries() iterates over every memory descriptor.
+    // Each descriptor describes one contiguous zone of physical RAM.
+    for descriptor in uefi_memory_map.entries() {
+        // Convert the UEFI memory type into our MemoryRegionKind enum.
+        // This hides UEFI internals from the kernel — it only sees our types.
+        // match works like switch/case : it compares descriptor.ty to each arm.
+        let kind = match descriptor.ty {
+            // CONVENTIONAL = normal free RAM the kernel can use freely.
+            MemoryType::CONVENTIONAL => MemoryRegionKind::Usable,
+
+            // LOADER_CODE and LOADER_DATA = our bootloader's own memory.
+            // The "|" means "either of these two values matches".
+            // The kernel can reclaim this memory once boot is complete.
+            MemoryType::LOADER_CODE | MemoryType::LOADER_DATA => {
+                MemoryRegionKind::BootloaderReclaimable
+            }
+
+            // RUNTIME_SERVICES = UEFI runtime memory that must be preserved.
+            // Even after exit_boot_services(), some UEFI calls still need it.
+            MemoryType::RUNTIME_SERVICES_CODE | MemoryType::RUNTIME_SERVICES_DATA => {
+                MemoryRegionKind::UefiRuntime
+            }
+
+            // Everything else (ACPI, MMIO, unknown) is reserved.
+            // The underscore "_" is a wildcard matching anything not listed above.
+            _ => MemoryRegionKind::Reserved,
+        };
+
+        // Build a MemoryRegion from the UEFI descriptor and add it to our map.
+        // phys_start = physical base address of this zone.
+        // page_count = size in 4KB pages — multiply by 4096 to get bytes.
+        boot_info.memory_map.add_entry(MemoryRegion {
+            base: descriptor.phys_start,
+            length: descriptor.page_count * 4096,
+            kind,
+        });
+    }
+
+    // Jump to the kernel, passing a pointer to our completed BootInfo.
+    jump_to_kernel(entry_point, &boot_info);
 }
-
 // ------------------------------------------------------------
 // Step 1 : Initialize UEFI services
 // ------------------------------------------------------------
 
 /// Initializes the UEFI helper library.
-///
-/// This must be the very first call in the bootloader.
-/// Without it, no UEFI service (screen, disk, memory) is available.
-/// Calling any UEFI function before this will result in a crash.
+/// Must be the very first call — nothing works before this.
 fn init_uefi() {
     uefi::helpers::init().unwrap();
 }
@@ -93,10 +144,6 @@ fn init_uefi() {
 // ------------------------------------------------------------
 
 /// Clears the screen and displays the KernOS boot banner.
-///
-/// Uses the UEFI text output protocol (stdout).
-/// Note : UEFI requires UTF-16 strings, hence the cstr16! macro.
-/// Note : UEFI requires \r\n (carriage return + line feed), not just \n.
 fn display_banner() {
     uefi::system::with_stdout(|stdout| {
         stdout.clear().unwrap();
@@ -104,7 +151,7 @@ fn display_banner() {
             .output_string(cstr16!("============================================\r\n"))
             .unwrap();
         stdout
-            .output_string(cstr16!("  KernOS v1.2.0\r\n"))
+            .output_string(cstr16!("  KernOS v1.0.0\r\n"))
             .unwrap();
         stdout
             .output_string(cstr16!("  Bootloader starting...\r\n"))
@@ -116,60 +163,28 @@ fn display_banner() {
 }
 
 // ------------------------------------------------------------
-// Step 3 : Load the kernel from disk
+// Step 3 : Load the kernel
 // ------------------------------------------------------------
 
-/// # First version explaination here :
-/// Reads the kernel ELF file from the FAT32 partition into memory.
-///
-/// The kernel file must be located at the root of the EFI partition
-/// and named exactly "kernel.elf". This path is fixed by convention.
-///
-/// # How it works
-/// 1. Locate the UEFI SimpleFileSystem protocol (FAT32 access).
-/// 2. Open the root directory of the partition.
-/// 3. Open "kernel.elf" in read-only mode.
-/// 4. Read the file size from its metadata.
-/// 5. Allocate a memory buffer large enough to hold the file.
-/// 6. Read the entire file into that buffer.
-///
-/// # Returns
-/// A mutable byte slice containing the raw ELF file data.
-/// This slice is valid until we exit UEFI boot services.
-///
-/// # New Version explaination here :
 /// Loads the kernel into memory.
 ///
 /// Tries two methods in order :
-/// 1. SimpleFileSystem — works in QEMU and when a FAT32 disk is present.
-/// 2. PXE TFTP download — works when booted over the network.
-///
-/// # Returns
-/// A mutable byte slice containing the raw ELF file data.
+/// 1. SimpleFileSystem — works in QEMU and with a local FAT32 disk.
+/// 2. PXE TFTP — works when booted over the network.
 fn load_kernel() -> &'static mut [u8] {
-    // First attempt : try to load from a FAT32 filesystem.
-    // This works in QEMU (disk image) and on real hardware with a FAT32 partition.
     if let Some(data) = try_load_from_disk() {
         return data;
     }
-
-    // Second attempt : try to download via PXE TFTP.
-    // This works when the machine booted over the network.
     if let Some(data) = try_load_via_pxe() {
         return data;
     }
-
-    // Both methods failed — we cannot continue.
     panic!("Failed to load kernel.elf — no disk and no PXE available");
 }
 
 /// Attempts to load kernel.elf from a FAT32 filesystem.
 /// Returns None if no filesystem is available or the file is not found.
 fn try_load_from_disk() -> Option<&'static mut [u8]> {
-    // Try to find a SimpleFileSystem handle.
-    // This fails if there is no FAT32 partition accessible.
     let fs_handle = uefi::boot::get_handle_for_protocol::<SimpleFileSystem>().ok()?;
-
     let mut fs = uefi::boot::open_protocol_exclusive::<SimpleFileSystem>(fs_handle).ok()?;
     let mut root = fs.open_volume().ok()?;
 
@@ -191,7 +206,6 @@ fn try_load_from_disk() -> Option<&'static mut [u8]> {
     let kernel_size = info.file_size() as usize;
 
     let kernel_buffer = uefi::boot::allocate_pool(MemoryType::LOADER_DATA, kernel_size).ok()?;
-
     let kernel_data =
         unsafe { core::slice::from_raw_parts_mut(kernel_buffer.as_ptr(), kernel_size) };
 
@@ -215,9 +229,7 @@ fn try_load_via_pxe() -> Option<&'static mut [u8]> {
     let pxe_handle = uefi::boot::get_handle_for_protocol::<BaseCode>().ok()?;
     let mut pxe = uefi::boot::open_protocol_exclusive::<BaseCode>(pxe_handle).ok()?;
 
-    // Hardcode the TFTP server IP.
-    // In our lab setup, the PXE server is always the VM at 192.168.100.1.
-    // This avoids having to parse the private DHCP packet fields.
+    // The TFTP server is always our VM at 192.168.100.1 in our lab setup.
     let server_ip = IpAddress::new_v4([192, 168, 100, 1]);
 
     let file_size: u64 = match pxe.tftp_get_file_size(&server_ip, cstr8!("kernel.elf")) {
@@ -227,12 +239,13 @@ fn try_load_via_pxe() -> Option<&'static mut [u8]> {
     let kernel_size = file_size as usize;
 
     let kernel_buffer = uefi::boot::allocate_pool(MemoryType::LOADER_DATA, kernel_size).ok()?;
-
     let kernel_data =
         unsafe { core::slice::from_raw_parts_mut(kernel_buffer.as_ptr(), kernel_size) };
 
-    pxe.tftp_read_file(&server_ip, cstr8!("kernel.elf"), Some(kernel_data))
-        .ok()?;
+    match pxe.tftp_read_file(&server_ip, cstr8!("kernel.elf"), Some(kernel_data)) {
+        Ok(_) => {}
+        Err(_) => return None,
+    }
 
     uefi::system::with_stdout(|stdout| {
         stdout
@@ -244,71 +257,85 @@ fn try_load_via_pxe() -> Option<&'static mut [u8]> {
 }
 
 // ------------------------------------------------------------
-// Step 4 : Parse the ELF file and load segments into memory
+// Step 4 : Parse ELF and load segments
 // ------------------------------------------------------------
 
-/// Parses the kernel ELF binary and copies each loadable segment
-/// into its correct physical memory address.
+/// Parses the kernel ELF binary, copies each LOAD segment into
+/// its correct physical address, and records the kernel location
+/// in boot_info so the PMM can mark it as non-free.
 ///
-/// # What is an ELF file ?
-/// ELF (Executable and Linkable Format) is the standard binary format
-/// for executables on Linux and bare-metal x86_64 systems.
-/// It contains :
-///   - A header  : architecture, entry point address, etc.
-///   - Segments  : blocks of code or data to load into memory.
-///   - Sections  : debug info, symbol tables (not needed here).
-///
-/// # What we do here
-/// 1. Parse the ELF header to validate the binary.
-/// 2. Iterate over all program headers (segment descriptors).
-/// 3. For each LOAD segment, copy its data to the correct RAM address.
-/// 4. Extract and return the kernel entry point address.
-///
-/// # Why only LOAD segments ?
-/// Only LOAD segments contain code or data that must be in RAM
-/// for the kernel to execute. Other types (NOTE, DYNAMIC, GNU_STACK)
-/// are metadata for tools and are not needed at runtime.
-///
-/// # Returns
-/// A raw function pointer to the kernel entry point.
-/// The bootloader will jump to this address in Step 7.
-fn parse_and_load_elf(kernel_data: &[u8]) -> *const () {
+/// Returns the kernel entry point address.
+fn parse_and_load_elf(kernel_data: &[u8], boot_info: &mut BootInfo) -> *const () {
     // Parse the raw bytes as an ELF file.
-    // ElfFile::new validates the ELF magic number (0x7F 'E' 'L' 'F')
-    // and checks that the architecture is x86_64.
+    // ElfFile::new checks the magic number (0x7F 'E' 'L' 'F') at the
+    // start of the file to confirm it is a valid ELF binary.
+    // It also checks the architecture is x86_64.
+    // unwrap() panics if the file is invalid — we cannot continue without a valid kernel.
     let elf = ElfFile::new(kernel_data).unwrap();
 
-    // Iterate over every program header in the ELF file.
-    // Each program header describes one segment.
+    // We track the lowest and highest physical addresses used by the kernel.
+    // At the end, we use these to tell the kernel where it lives in RAM
+    // so the PMM can mark that zone as "do not overwrite".
+    let mut kernel_start = u64::MAX; // start at maximum so any address is lower
+    let mut kernel_end = 0u64; // start at zero so any address is higher
+
+    // An ELF file contains multiple "segments" — blocks of code or data.
+    // We iterate over every segment header to find the ones we need to load.
     for segment in elf.program_iter() {
-        // Skip segments that are not of type LOAD.
-        // Only LOAD segments need to be copied into RAM.
+        // We only care about segments of type LOAD.
+        // LOAD segments contain actual code and data that must be in RAM.
+        // Other types (NOTE, GNU_STACK, DYNAMIC) are metadata — skip them.
         if segment.get_type().unwrap() != Type::Load {
-            continue;
+            continue; // "continue" skips to the next iteration of the loop
         }
 
-        // Get the target physical address for this segment.
-        // This is where in RAM we must copy the segment data.
-        // The ELF linker script determines these addresses.
-        let phys_addr = segment.physical_addr() as *mut u8;
+        // physical_addr() tells us where in RAM this segment must be placed.
+        // This address comes from our linker script (kernel.ld).
+        // For example, 0x100000 = 1 MB — where we told the linker to place the kernel.
+        let phys_addr = segment.physical_addr();
 
-        // Get the raw bytes of this segment from the ELF file.
-        // SegmentData::Undefined is the variant for raw binary data,
-        // which is what code and initialized data segments contain.
+        // mem_size() is the size of this segment in memory.
+        // It may be larger than the data in the file (e.g. BSS — zero-initialized data).
+        let seg_size = segment.mem_size();
+
+        // Update our tracking of the kernel's memory range.
+        // After the loop, kernel_start..kernel_end covers the entire kernel.
+        if phys_addr < kernel_start {
+            kernel_start = phys_addr;
+        }
+        if phys_addr + seg_size > kernel_end {
+            kernel_end = phys_addr + seg_size;
+        }
+
+        // Cast the physical address to a raw pointer so we can write to it.
+        // *mut u8 means "a pointer to a mutable byte".
+        let dst = phys_addr as *mut u8;
+
+        // get_data() extracts the raw bytes of this segment from the ELF file.
+        // SegmentData::Undefined is the variant for raw binary data — which is
+        // what code (.text) and initialized data (.data) segments contain.
+        // If it is any other variant (e.g. Note), we skip it with "continue".
         let data = match segment.get_data(&elf).unwrap() {
             SegmentData::Undefined(data) => data,
             _ => continue,
         };
 
-        // Copy the segment bytes to the target RAM address.
-        // copy_nonoverlapping is equivalent to memcpy in C.
-        // It requires unsafe because we write to a raw pointer.
-        // We trust the ELF linker script to have placed segments
-        // at valid, non-overlapping memory addresses.
+        // Copy the segment bytes from the ELF file into RAM at the target address.
+        // copy_nonoverlapping is the Rust equivalent of memcpy in C.
+        // It copies data.len() bytes from data.as_ptr() to dst.
+        // unsafe is required because we are writing to a raw pointer —
+        // the compiler cannot verify the destination address is valid.
+        // We trust our linker script to have chosen a safe address.
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), phys_addr, data.len());
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
     }
+
+    // Store the kernel's physical location in boot_info.
+    // The PMM (Brick 3) will use this to mark kernel memory as non-free.
+    // Without this, the PMM might hand out kernel memory to someone else — catastrophic.
+    boot_info.kernel_physical_start = kernel_start;
+    boot_info.kernel_size = kernel_end - kernel_start;
 
     uefi::system::with_stdout(|stdout| {
         stdout
@@ -316,131 +343,164 @@ fn parse_and_load_elf(kernel_data: &[u8]) -> *const () {
             .unwrap();
     });
 
-    // Extract the kernel entry point from the ELF header.
-    // This is the virtual address of the first instruction to execute.
-    // We cast it to a raw function pointer for use in jump_to_kernel().
+    // Return the entry point address from the ELF header.
+    // This is the address of kernel_main() — the first function the kernel runs.
+    // We cast it to *const () which is Rust's way of saying "a raw function pointer
+    // whose exact type we don't know yet". jump_to_kernel() will cast it properly.
     elf.header.pt2.entry_point() as *const ()
 }
-
 // ------------------------------------------------------------
-// Step 5 : Retrieve the memory map
+// Step 5 : Collect framebuffer information
 // ------------------------------------------------------------
 
-/// Asks the UEFI firmware for the current system memory map.
+/// Retrieves the UEFI GOP framebuffer address and dimensions
+/// and stores them in boot_info.
 ///
-/// The memory map is a list of all physical memory zones, each described
-/// by a type (free, used by firmware, reserved by hardware, etc.).
-///
-/// The kernel needs this map to know which memory zones it can use
-/// and which ones it must avoid.
-///
-/// # Timing
-/// This must be called as late as possible, right before exiting
-/// UEFI boot services. The memory map changes every time UEFI
-/// allocates or frees memory, so an early snapshot would be stale.
-///
-/// After exit_boot_services(), we can no longer call this function.
-fn get_memory_map() {
-    // Request the memory map from UEFI.
-    // MemoryType::LOADER_DATA tells UEFI to allocate the map buffer
-    // in a LOADER_DATA zone, so the kernel can find and reuse it.
-    // We prefix with _ to silence the unused variable warning.
-    // The map is consumed internally by exit_boot_services().
-    let _memory_map = uefi::boot::memory_map(MemoryType::LOADER_DATA).unwrap();
+/// The kernel display driver (Brick 2) uses this to draw pixels.
+/// If no GOP framebuffer is available, boot_info.framebuffer stays None.
+fn fill_framebuffer_info(boot_info: &mut BootInfo) {
+    // GraphicsOutput is the UEFI protocol for screen access (GOP = Graphics Output Protocol).
+    // We ask UEFI for a handle (identifier) that supports this protocol.
+    // If no graphics output is available, we skip silently — the kernel can still run
+    // in text mode or without any display.
+    use uefi::proto::console::gop::GraphicsOutput;
+
+    let gop_handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
+        Ok(h) => h,
+        Err(_) => {
+            uefi::system::with_stdout(|stdout| {
+                stdout
+                    .output_string(cstr16!("[WARN] No GOP framebuffer found\r\n"))
+                    .unwrap();
+            });
+            // Return early — boot_info.framebuffer stays None.
+            return;
+        }
+    };
+
+    // Open the GraphicsOutput protocol so we can query it.
+    // "exclusive" means no other UEFI agent uses it simultaneously.
+    let mut gop = uefi::boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).unwrap();
+
+    // current_mode_info() returns the current screen resolution and pixel format.
+    let mode = gop.current_mode_info();
+
+    // resolution() returns (width, height) in pixels.
+    let (width, height) = mode.resolution();
+
+    // stride() is the number of pixels per row including any alignment padding.
+    // It is >= width. The actual bytes per row = stride * bytes_per_pixel.
+    let stride = mode.stride() as u32;
+
+    // frame_buffer() gives us direct access to the video memory.
+    // as_mut_ptr() returns the physical base address as a raw pointer.
+    // Anything written here appears directly on screen.
+    let framebuffer_base = gop.frame_buffer().as_mut_ptr() as u64;
+
+    // size() returns the total size of the framebuffer in bytes.
+    let framebuffer_size = gop.frame_buffer().size();
+
+    // Fill our FramebufferInfo structure with everything the kernel needs.
+    // The Some() wraps the value in an Option — it means "a value is present".
+    boot_info.framebuffer = Some(FramebufferInfo {
+        base: framebuffer_base,
+        size: framebuffer_size,
+        width: width as u32,
+        height: height as u32,
+        stride,
+        // UEFI GOP uses 32-bit pixels : 8 bits each for Blue, Green, Red, and padding.
+        bytes_per_pixel: 4,
+    });
 
     uefi::system::with_stdout(|stdout| {
         stdout
-            .output_string(cstr16!("[OK] Memory map retrieved\r\n"))
+            .output_string(cstr16!("[OK] Framebuffer info collected\r\n"))
             .unwrap();
+    });
+}
+// ------------------------------------------------------------
+// Step 6 : Collect ACPI RSDP address
+// ------------------------------------------------------------
+
+/// Finds the ACPI RSDP table address from the UEFI configuration table.
+/// The kernel will use this later for advanced hardware initialization.
+fn fill_rsdp_info(boot_info: &mut BootInfo) {
+    use uefi::table::cfg;
+
+    // The UEFI system table contains a list of configuration tables.
+    // We look for the ACPI 2.0 RSDP entry (preferred over ACPI 1.0).
+    let rsdp = uefi::system::with_config_table(|tables| {
+        // First try ACPI 2.0
+        for entry in tables {
+            if entry.guid == cfg::ACPI2_GUID {
+                return Some(entry.address as u64);
+            }
+        }
+        // Fall back to ACPI 1.0
+        for entry in tables {
+            if entry.guid == cfg::ACPI_GUID {
+                return Some(entry.address as u64);
+            }
+        }
+        None
+    });
+
+    boot_info.rsdp_address = rsdp;
+
+    uefi::system::with_stdout(|stdout| {
+        if boot_info.rsdp_address.is_some() {
+            stdout
+                .output_string(cstr16!("[OK] ACPI RSDP found\r\n"))
+                .unwrap();
+        } else {
+            stdout
+                .output_string(cstr16!("[WARN] No ACPI RSDP found\r\n"))
+                .unwrap();
+        }
     });
 }
 
 // ------------------------------------------------------------
-// Step 6 : Exit UEFI boot services
+// Step 7 : Jump to kernel
 // ------------------------------------------------------------
 
-/// Transfers full control of the machine from UEFI to our kernel.
+/// Transfers execution permanently to the kernel.
 ///
-/// This is the point of no return. After this function :
-///   - All UEFI services are gone (no screen, no disk, no memory services).
-///   - The UEFI firmware frees its own memory zones.
-///   - The CPU belongs entirely to the kernel.
+/// Passes a pointer to BootInfo as the first argument so the
+/// kernel has access to all boot-time information.
 ///
-/// # Why is this unsafe ?
-/// exit_boot_services() causes the firmware to free its own memory.
-/// Pointers that were valid one moment before may become invalid instantly.
-/// The Rust compiler cannot verify this, so we must use unsafe
-/// and take full responsibility for correctness.
-fn exit_boot_services() {
-    uefi::system::with_stdout(|stdout| {
-        stdout
-            .output_string(cstr16!("Exiting UEFI boot services...\r\n"))
-            .unwrap();
-    });
-
-    // Exit UEFI boot services.
-    // After this line, no UEFI call is valid anymore.
-    // MemoryType::LOADER_DATA tells UEFI where to store the final
-    // memory map that describes what it freed when shutting down.
-    let _final_memory_map = unsafe { uefi::boot::exit_boot_services(MemoryType::LOADER_DATA) };
-}
-
-// ------------------------------------------------------------
-// Step 7 : Jump to the kernel entry point
-// ------------------------------------------------------------
-
-/// Transfers execution to the kernel by calling its entry point.
-///
-/// This function never returns. Once the kernel starts, the bootloader
-/// is gone. The kernel takes full and permanent control of the machine.
-///
-/// # How it works
-/// The entry point is a raw memory address obtained from the ELF header.
-/// We cast it to a Rust function pointer and call it.
-/// The "C" ABI ensures the call follows the standard x86_64 calling
-/// convention that the kernel expects.
-///
-/// # Why is this unsafe ?
-/// We are calling a raw function pointer. The compiler has no way
-/// to verify that this address is valid or that the function signature
-/// matches. We trust the ELF parser to have given us the correct address.
-///
-/// # Why -> ! ?
-/// The ! return type means "this function never returns".
-/// Rust requires this here because main() must return a Status,
-/// but after jumping to the kernel, we never come back.
-fn jump_to_kernel(entry_point: *const ()) -> ! {
+/// The kernel entry point must have this exact signature :
+///   pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> !
+fn jump_to_kernel(entry_point: *const (), boot_info: &BootInfo) -> ! {
     unsafe {
-        // Cast the raw address to a callable function pointer.
-        // extern "C" = use the standard C calling convention (ABI).
-        // fn() -> !  = a function that takes no arguments and never returns.
-        let kernel_entry: extern "C" fn() -> ! = core::mem::transmute(entry_point);
+        // core::mem::transmute reinterprets raw bytes as a different type.
+        // Here we cast a raw address (*const ()) into a typed function pointer.
+        // The function signature must exactly match kernel_main() in the kernel :
+        //   pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> !
+        //
+        // extern "C" means the function uses the standard C calling convention.
+        // On x86_64, the first argument is always passed in the "rdi" register.
+        // So boot_info's address will be in rdi when the kernel starts.
+        let kernel_entry: extern "C" fn(*const BootInfo) -> ! = core::mem::transmute(entry_point);
 
-        // Call the kernel entry point.
-        // This transfers control permanently to the kernel.
-        // The bootloader never executes another instruction after this.
-        kernel_entry()
+        // Call the kernel entry point with a pointer to our BootInfo.
+        // "as *const BootInfo" converts the reference &BootInfo into a raw pointer.
+        // After this line, the bootloader never executes another instruction.
+        kernel_entry(boot_info as *const BootInfo)
     }
 }
-
 // ------------------------------------------------------------
-// Panic Handler
+// Panic handler
 // ------------------------------------------------------------
 
-/// Called automatically by Rust if the program panics.
-///
-/// A panic occurs when an unwrap() fails or when the program
-/// reaches an explicitly unreachable state.
-///
-/// In no_std mode, Rust requires us to define this handler ourselves
-/// because the standard library's panic handler is not available.
-///
-/// Currently we loop forever. A future improvement would be to
-/// display the panic message on screen before halting.
+/// Called if any unwrap() fails or the program reaches an
+/// unreachable state. Displays an error and loops forever.
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     uefi::system::with_stdout(|stdout| {
-        stdout.output_string(cstr16!("Problem...\r\n")).unwrap();
+        stdout
+            .output_string(cstr16!("[PANIC] Bootloader panic\r\n"))
+            .unwrap();
     });
     loop {}
 }
