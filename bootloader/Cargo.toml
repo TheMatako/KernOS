@@ -13,6 +13,7 @@ version = "1.2.0"
 edition = "2021"
 
 [dependencies]
+shared = { version = "0.1.0", path = "../shared" }
 # The uefi crate gives us access to all UEFI firmware services :
 # screen output, memory map, disk access, etc.
 # Without it we would have to write all the UEFI protocol code ourselves.
