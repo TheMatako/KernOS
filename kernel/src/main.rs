@@ -21,6 +21,7 @@
 // ------------------------------------------------------------
 // Kernel Entry Point
 // ------------------------------------------------------------
+use shared::BootInfo;
 
 /// First function called by the bootloader after it jumps to the kernel.
 ///
@@ -32,7 +33,7 @@
 /// This function must never return.
 /// Returning here would jump back into undefined memory.
 #[no_mangle]
-pub extern "C" fn kernel_main() -> ! {
+pub extern "C" fn kernel_main(_boot_info: *const BootInfo) -> ! {
     // TODO : Brick 1 - initialize the kernel environment
     panic!()
 }
