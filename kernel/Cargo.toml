@@ -11,4 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 shared = { version = "0.1.0", path = "../shared" }
-x86_64 = { version = "0.15", default-features = false, features = ["instructions"] }
+x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
