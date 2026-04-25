@@ -5,15 +5,17 @@
 // This is the kernel entry point.
 // The bootloader loads this file and jumps to kernel_main().
 //
-// Brick 1 and 2
+// Brick 1, 2, 3 and 4
 // Execution order in `kernel_main`:
 //   1. Zero BSS           (mandatory — must be first)
 //   2. Serial (UART)      (our only debug output)
 //   3. GDT + TSS          (segment descriptors, IST stack for #DF)
 //   4. IDT                (exception / interrupt handlers)
 //   5. PMM
-//   6. Enable interrupts  (STI — safe now that IDT is loaded)
-//   7. Spin (hlt loop)
+//   6. VMM
+//   7. SLAB
+//   8. Enable interrupts  (STI — safe now that IDT is loaded)
+//   9. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -34,6 +36,8 @@ mod gdt;
 mod idt;
 mod pmm;
 mod serial;
+mod slab;
+mod vmm;
 
 use shared::BootInfo;
 
@@ -129,14 +133,22 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // Print full RAM stats — good sanity check before VMM.
     pmm::print_stats();
 
-    crate::kprintln!("=================");
-    // ── 6. Enable interrupts ──────────────────────────────────────────────────
+    // ── 6. VMM ────────────────────────────────────────────────────────────────
+    // We pass total installed RAM (usable frames × 4 KiB) to vmm::init so it
+    // knows how large the direct physical map needs to be.
+    let installed_ram = pmm::total_usable_frames() as u64 * pmm::FRAME_SIZE;
+    unsafe { vmm::init(installed_ram) };
+
+    // ── 7. Slab allocator ─────────────────────────────────────────────────────
+    slab::init();
+
+    // ── 8. Enable interrupts ──────────────────────────────────────────────────
     // Safety: IDT is fully loaded; safe to unmask hardware IRQs.
     x86_64::instructions::interrupts::enable();
 
-    kprintln!("Brick 3 complete - PMM operational.");
+    kprintln!("Brick 4 complete - VMM operational.");
 
-    // ── 6. Spin forever ───────────────────────────────────────────────────────
+    // ── 9. Spin forever ───────────────────────────────────────────────────────
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
