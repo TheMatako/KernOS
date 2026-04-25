@@ -11,8 +11,9 @@
 //   2. Serial (UART)      (our only debug output)
 //   3. GDT + TSS          (segment descriptors, IST stack for #DF)
 //   4. IDT                (exception / interrupt handlers)
-//   5. Enable interrupts  (STI — safe now that IDT is loaded)
-//   6. Spin (hlt loop)
+//   5. PMM
+//   6. Enable interrupts  (STI — safe now that IDT is loaded)
+//   7. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -31,6 +32,7 @@
 // ------------------------------------------------------------
 mod gdt;
 mod idt;
+mod pmm;
 mod serial;
 
 use shared::BootInfo;
@@ -96,8 +98,9 @@ macro_rules! kprintln {
 ///
 /// This function must never return.
 /// Returning here would jump back into undefined memory.
+/// # Safety
 #[no_mangle]
-pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
+pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // ── 1. Zero BSS ──────────────────────────────────────────────────────────
     unsafe { zero_bss() };
 
@@ -117,13 +120,21 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // ── 4. Load IDT ──────────────────────────────────────────────────────────
     idt::init();
 
-    // ── 5. Enable interrupts ──────────────────────────────────────────────────
+    // ── 5. PMM ────────────────────────────────────────────────────────────────
+    //
+    // Safety: single-threaded; boot_info is valid (non-null checked above).
+    let memory_map = unsafe { &(*boot_info).memory_map };
+    unsafe { pmm::init(memory_map) };
+
+    // Print full RAM stats — good sanity check before VMM.
+    pmm::print_stats();
+
+    crate::kprintln!("=================");
+    // ── 6. Enable interrupts ──────────────────────────────────────────────────
     // Safety: IDT is fully loaded; safe to unmask hardware IRQs.
     x86_64::instructions::interrupts::enable();
 
-    kprintln!("Interrupts enabled.");
-    kprintln!("Brick 2 complete — GDT/IDT/interrupts operational.");
-    kprintln!("Spinning (hlt loop)...");
+    kprintln!("Brick 3 complete - PMM operational.");
 
     // ── 6. Spin forever ───────────────────────────────────────────────────────
     loop {
