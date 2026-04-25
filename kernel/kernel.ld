@@ -34,6 +34,8 @@ SECTIONS {
 
     /* Zero-initialized data : global variables set to zero at startup */
     .bss : {
+        __bss_start = .;
         *(.bss .bss.*)
+        __bss_end = .;
     }
 }
