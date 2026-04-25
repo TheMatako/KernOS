@@ -5,12 +5,14 @@
 // This is the kernel entry point.
 // The bootloader loads this file and jumps to kernel_main().
 //
-// For now this is a minimal stub that does nothing.
-// It will be expanded brick by brick starting from Brick 1.
-//
+// Brick 1 and 2
 // Execution order in `kernel_main`:
 //   1. Zero BSS           (mandatory — must be first)
 //   2. Serial (UART)      (our only debug output)
+//   3. GDT + TSS          (segment descriptors, IST stack for #DF)
+//   4. IDT                (exception / interrupt handlers)
+//   5. Enable interrupts  (STI — safe now that IDT is loaded)
+//   6. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -21,10 +23,14 @@
 #![no_std]
 // No automatic entry point - we define our own below
 #![no_main]
+// Required by the x86_64 crate's `extern "x86-interrupt"` calling convention.
+#![feature(abi_x86_interrupt)]
 
 // ------------------------------------------------------------
 // Kernel Entry Point
 // ------------------------------------------------------------
+mod gdt;
+mod idt;
 mod serial;
 
 use shared::BootInfo;
@@ -105,6 +111,20 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
         panic!("boot_info is null — bootloader bug");
     }
 
+    // ── 3. Load GDT + TSS ────────────────────────────────────────────────────
+    gdt::init();
+
+    // ── 4. Load IDT ──────────────────────────────────────────────────────────
+    idt::init();
+
+    // ── 5. Enable interrupts ──────────────────────────────────────────────────
+    // Safety: IDT is fully loaded; safe to unmask hardware IRQs.
+    x86_64::instructions::interrupts::enable();
+
+    kprintln!("Interrupts enabled.");
+    kprintln!("Brick 2 complete — GDT/IDT/interrupts operational.");
+    kprintln!("Spinning (hlt loop)...");
+
     // ── 6. Spin forever ───────────────────────────────────────────────────────
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
@@ -121,6 +141,9 @@ pub extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
 /// Later we will display an error message and halt the CPU properly.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Disable interrupts so a timer IRQ cannot re-enter the panic path.
+    x86_64::instructions::interrupts::disable();
+
     kprintln!("\n!!! KERNEL PANIC !!!");
     kprintln!("{}", info);
 
