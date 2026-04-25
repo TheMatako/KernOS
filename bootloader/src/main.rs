@@ -22,7 +22,7 @@
 
 #![no_std]
 #![no_main]
-
+#![allow(static_mut_refs)]
 // ------------------------------------------------------------
 // Imports
 // ------------------------------------------------------------
@@ -40,6 +40,8 @@ use xmas_elf::ElfFile;
 // Entry point
 // ------------------------------------------------------------
 
+static mut BOOT_INFO_STORAGE: BootInfo = BootInfo::new();
+
 #[entry]
 fn main() -> Status {
     init_uefi();
@@ -47,20 +49,20 @@ fn main() -> Status {
 
     // Create the BootInfo structure that we will pass to the kernel.
     // It starts empty and gets filled step by step below.
-    let mut boot_info = BootInfo::new();
+    let boot_info = unsafe { &mut BOOT_INFO_STORAGE };
 
     // Load the kernel binary into memory from disk or via PXE.
     let kernel_data = load_kernel();
 
     // Parse the ELF file, copy segments into RAM, and record
     // the kernel's physical location in boot_info.
-    let entry_point = parse_and_load_elf(kernel_data, &mut boot_info);
+    let entry_point = parse_and_load_elf(kernel_data, boot_info);
 
     // Collect GOP framebuffer address and dimensions.
-    fill_framebuffer_info(&mut boot_info);
+    fill_framebuffer_info(boot_info);
 
     // Collect the ACPI RSDP address for later hardware initialization.
-    fill_rsdp_info(&mut boot_info);
+    fill_rsdp_info(boot_info);
 
     // Get the UEFI memory map right before exiting boot services.
     // We let Rust infer the concrete type — it is not publicly exposed.
@@ -127,7 +129,7 @@ fn main() -> Status {
     }
 
     // Jump to the kernel, passing a pointer to our completed BootInfo.
-    jump_to_kernel(entry_point, &boot_info);
+    jump_to_kernel(entry_point, boot_info);
 }
 // ------------------------------------------------------------
 // Step 1 : Initialize UEFI services
@@ -481,7 +483,8 @@ fn jump_to_kernel(entry_point: *const (), boot_info: &BootInfo) -> ! {
         // extern "C" means the function uses the standard C calling convention.
         // On x86_64, the first argument is always passed in the "rdi" register.
         // So boot_info's address will be in rdi when the kernel starts.
-        let kernel_entry: extern "C" fn(*const BootInfo) -> ! = core::mem::transmute(entry_point);
+        let kernel_entry: extern "sysv64" fn(*const BootInfo) -> ! =
+            core::mem::transmute(entry_point);
 
         // Call the kernel entry point with a pointer to our BootInfo.
         // "as *const BootInfo" converts the reference &BootInfo into a raw pointer.
