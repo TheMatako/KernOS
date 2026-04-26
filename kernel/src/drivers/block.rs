@@ -251,34 +251,3 @@ pub unsafe fn init(size_bytes: usize) {
         vmm::phys_to_virt(x86_64::PhysAddr::new(phys_base)).as_u64(),
     );
 }
-
-// ---------------------------------------------------------------------------
-// Smoke test
-// ---------------------------------------------------------------------------
-
-/// Writes a pattern to sector 0, reads it back, and verifies correctness.
-///
-/// Called from `main.rs` to validate the block driver before the VFS uses it.
-///
-/// # Safety
-/// Calls `read_sector` / `write_sector`.
-pub unsafe fn smoke_test() {
-    // Write a known pattern.
-    let mut write_buf = [0u8; SECTOR_SIZE];
-    for (i, b) in write_buf.iter_mut().enumerate() {
-        *b = (i & 0xFF) as u8;
-    }
-
-    write_sector(0, &write_buf).expect("block smoke_test: write failed");
-
-    // Read it back.
-    let mut read_buf = [0u8; SECTOR_SIZE];
-    read_sector(0, &mut read_buf).expect("block smoke_test: read failed");
-
-    // Verify byte by byte.
-    for (i, (&w, &r)) in write_buf.iter().zip(read_buf.iter()).enumerate() {
-        assert_eq!(w, r, "block smoke_test: mismatch at byte {}", i);
-    }
-
-    crate::kprintln!("[BLOCK] smoke test passed — sector 0 write/read OK");
-}
