@@ -14,11 +14,12 @@
 //   5. PMM
 //   6. VMM
 //   7. SLAB
-//   8. APIC
-//   9. SCHEDULER
-//  10. SYSCALL
-//  11. Enable interrupts  (STI — safe now that IDT is loaded)
-//  12. Spin (hlt loop)
+//   8. DRIVERS            (keyboard + PCI + block)
+//   9. APIC
+//  10. SCHEDULER
+//  11. SYSCALL
+//  12. Enable interrupts  (STI — safe now that IDT is loaded)
+//  13. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -36,6 +37,7 @@
 // Kernel Entry Point
 // ------------------------------------------------------------
 mod apic;
+mod drivers;
 mod gdt;
 mod idt;
 mod pmm;
@@ -99,44 +101,6 @@ macro_rules! kprintln {
     ($($arg:tt)*) => ($crate::kprint!("{}\n", format_args!($($arg)*)));
 }
 
-/// Demo user-mode task entry point.
-///
-/// This function will be jumped to from ring 3 via `iretq`.
-/// It uses the `syscall` instruction to communicate with the kernel.
-///
-/// Calling convention from ring 3 (Linux ABI):
-///   RAX = syscall number
-///   RDI, RSI = arguments
-unsafe extern "C" fn user_task_entry() -> ! {
-    // sys_write(buf, len) — write "Hello from ring 3!\n" to serial.
-    let msg = b"Hello from ring 3!\n";
-    core::arch::asm!(
-        "syscall",
-        in("rax") syscall::SYS_WRITE,
-        in("rdi") msg.as_ptr() as u64,
-        in("rsi") msg.len() as u64,
-        // RCX and R11 are clobbered by the CPU on syscall/sysret.
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-
-    // sys_exit(0) — terminate.
-    core::arch::asm!(
-        "syscall",
-        in("rax") syscall::SYS_EXIT,
-        in("rdi") 0u64,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack),
-    );
-
-    // Unreachable — sys_exit never returns.
-    loop {
-        core::arch::asm!("hlt", options(nomem, nostack));
-    }
-}
-
 /// First function called by the bootloader after it jumps to the kernel.
 ///
 /// At this point :
@@ -186,16 +150,43 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // ── 7. Slab allocator ─────────────────────────────────────────────────────
     slab::init();
 
-    // ── 8. APIC timer ─────────────────────────────────────────────────────────
+    // ── 8. Drivers ────────────────────────────────────────────────────────────
+    //
+    // RAM disk size: 32 MiB.  This is the backing store for the ext2 filesystem
+    // that the VFS layer (Brick 8) will format and mount.
+    //
+    // Aggressive RAM strategy: we allocate a large contiguous region up front
+    // so ext2 never has to deal with fragmented physical frames.
+    const RAM_DISK_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+    unsafe { drivers::init(RAM_DISK_SIZE) };
+
+    // Validate the block driver before the VFS uses it.
+    unsafe { drivers::block::smoke_test() };
+
+    // Print discovered PCI devices.
+    kprintln!("[PCI]  device list:");
+    for dev in drivers::pci::devices() {
+        kprintln!(
+            "  {:02x}:{:02x}.{}  {:04x}:{:04x}  {}",
+            dev.bus,
+            dev.slot,
+            dev.func,
+            dev.vendor_id,
+            dev.device_id,
+            dev.class_name(),
+        );
+    }
+
+    // ── 9. APIC timer ─────────────────────────────────────────────────────────
     // Must be called BEFORE scheduler::init() so the timer is ticking when
     // we enable interrupts.  The IDT handler (idt.rs) will call scheduler::tick()
     // on every timer interrupt.
     unsafe { apic::init() };
 
-    // ── 9. Scheduler ──────────────────────────────────────────────────────────
+    // ── 10. Scheduler ──────────────────────────────────────────────────────────
     unsafe { scheduler::init() };
 
-    // ── 10. Syscall ───────────────────────────────────────────────────────────
+    // ── 11. Syscall ───────────────────────────────────────────────────────────
     // Configures STAR / LSTAR / FMASK / EFER.SCE so that ring-3 tasks can
     // use the `syscall` instruction to enter the kernel.
     unsafe { syscall::init() };
@@ -203,27 +194,10 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // ── 12. Enable interrupts ─────────────────────────────────────────────────
     x86_64::instructions::interrupts::enable();
 
-    kprintln!("Brick 6 complete — syscall/sysret operational.");
-    kprintln!("Ring-3 entry demo: launching user_task_entry via iretq...");
+    kprintln!("Brick 7 complete — keyboard / PCI / block drivers operational.");
 
-    // ── Demo: jump to ring-3 ──────────────────────────────────────────────────
-    //
-    // Allocate a small user stack (one frame from the PMM, identity-mapped
-    // in the first 4 GiB), then use iretq to drop to ring 3.
-    //
-    // In a complete OS this would be done inside the scheduler when dispatching
-    // a user-mode process for the first time (Brick 7).
-    unsafe {
-        let user_stack_phys = pmm::alloc_frame().expect("main: OOM for user stack");
-
-        // Stack top = base + 4 KiB (stacks grow downward).
-        let user_stack_top = user_stack_phys + pmm::FRAME_SIZE;
-
-        // `user_task_entry` is currently a kernel function address.
-        // In a real OS it would live in a separate user address space;
-        // here it is identity-mapped (first 4 GiB) so the address is the same
-        // in both ring 0 and ring 3 — valid for this demo only.
-        syscall::jump_to_usermode(user_task_entry as *const () as u64, user_stack_top);
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
 }
 

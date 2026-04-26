@@ -42,7 +42,10 @@
 
 #![allow(static_mut_refs)]
 
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::{
+    instructions::port::Port,
+    structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode},
+};
 
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 
@@ -55,6 +58,66 @@ use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 /// Vectors 0–31 are reserved for CPU exceptions; we start hardware IRQs at 32
 /// (0x20) to avoid collisions.
 pub const APIC_TIMER_VECTOR: u8 = 0x20;
+
+/// Vector number for the PS/2 keyboard (IRQ 1 remapped above 0x20).
+///
+/// We remap IRQ 1 to vector 0x21 to avoid collision with CPU exceptions
+/// (0x00–0x1F).  The legacy 8259 PIC is configured accordingly in `init()`.
+pub const KEYBOARD_VECTOR: u8 = 0x21;
+
+// ---------------------------------------------------------------------------
+// Legacy 8259 PIC — minimal remapping
+// ---------------------------------------------------------------------------
+//
+// Even though we use the APIC for the timer, QEMU still routes the PS/2
+// keyboard through the legacy 8259 PIC (IRQ 1).  We must:
+//   1. Remap the master PIC so its IRQs start at 0x20 (not 0x08, which
+//      collides with CPU exceptions).
+//   2. Mask all PIC IRQs except IRQ 1 (keyboard).
+//   3. Send PIC EOI at the end of the keyboard handler.
+//
+// Master PIC ports.
+const PIC1_CMD: u16 = 0x20;
+const PIC1_DATA: u16 = 0x21;
+// Slave PIC ports.
+const PIC2_CMD: u16 = 0xA0;
+const PIC2_DATA: u16 = 0xA1;
+
+/// EOI command sent to the 8259 PIC to acknowledge a hardware IRQ.
+const PIC_EOI: u8 = 0x20;
+
+/// Remaps the 8259 PIC and masks all IRQs except IRQ 1 (keyboard).
+///
+/// # Safety
+/// Writes to I/O ports. Must be called once during IDT init.
+unsafe fn init_pic() {
+    let mut p1c: Port<u8> = Port::new(PIC1_CMD);
+    let mut p1d: Port<u8> = Port::new(PIC1_DATA);
+    let mut p2c: Port<u8> = Port::new(PIC2_CMD);
+    let mut p2d: Port<u8> = Port::new(PIC2_DATA);
+
+    // ICW1: start initialisation sequence, expect ICW4.
+    p1c.write(0x11);
+    p2c.write(0x11);
+
+    // ICW2: remap master to 0x20, slave to 0x28.
+    p1d.write(0x20); // master IRQs 0–7  → vectors 0x20–0x27
+    p2d.write(0x28); // slave  IRQs 8–15 → vectors 0x28–0x2F
+
+    // ICW3: tell master that slave is on IRQ 2; tell slave its cascade ID.
+    p1d.write(0x04); // master: slave on IRQ 2 (bit 2)
+    p2d.write(0x02); // slave: cascade identity = 2
+
+    // ICW4: 8086 mode.
+    p1d.write(0x01);
+    p2d.write(0x01);
+
+    // OCW1: mask all IRQs on both PICs except IRQ 1 (keyboard) on master.
+    // Master mask: 0b1111_1101 → only IRQ 1 unmasked.
+    // Slave  mask: 0b1111_1111 → all masked (no slave IRQs needed yet).
+    p1d.write(0b1111_1101);
+    p2d.write(0b1111_1111);
+}
 
 // ---------------------------------------------------------------------------
 // Static IDT
@@ -186,11 +249,19 @@ pub fn init() {
         // ── Hardware IRQ: APIC timer (vector 0x20) ────────────────────────────
         IDT[APIC_TIMER_VECTOR].set_handler_fn(handler_apic_timer);
 
+        // ── Hardware IRQ: PS/2 keyboard (vector 0x21) ─────────────────────────
+        IDT[KEYBOARD_VECTOR].set_handler_fn(handler_keyboard);
+
+        // ── Initialise and remap the legacy 8259 PIC ──────────────────────────
+        // Must be done before `lidt` so the PIC is configured before any
+        // hardware IRQ can fire.
+        init_pic();
+
         // ── Load the IDT (`lidt`) ─────────────────────────────────────────────
         IDT.load();
     }
 
-    crate::kprintln!("[IDT] loaded — 32 exception handlers + APIC timer stub installed.");
+    crate::kprintln!("[IDT] loaded — 32 exception handlers + APIC timer + keyboard.");
 }
 
 // ---------------------------------------------------------------------------
@@ -401,4 +472,25 @@ extern "x86-interrupt" fn handler_apic_timer(_frame: InterruptStackFrame) {
     // Safety: we are inside an interrupt handler — IF is already cleared by the
     // CPU, so no nested timer interrupt can fire during the switch.
     unsafe { crate::scheduler::tick() };
+}
+
+/// IRQ 1 handler — PS/2 keyboard.
+///
+/// Reads one scancode byte from port 0x60, decodes it to ASCII, and pushes
+/// the result into the keyboard ring buffer for `keyboard::read_char()`.
+///
+/// We also send EOI to the 8259 master PIC so it can deliver further IRQs.
+extern "x86-interrupt" fn handler_keyboard(_frame: InterruptStackFrame) {
+    // Decode the scancode and push ASCII into the ring buffer.
+    // Safety: reads I/O port 0x60; writes to static mut KB_BUF in keyboard.rs.
+    unsafe { crate::drivers::keyboard::handle_irq() };
+
+    // Send EOI to the master 8259 PIC (IRQ 1 is on the master).
+    // Without this the PIC will not deliver any further IRQs.
+    //
+    // Safety: writes to I/O port 0x20.
+    unsafe {
+        let mut pic1_cmd: Port<u8> = Port::new(PIC1_CMD);
+        pic1_cmd.write(PIC_EOI);
+    }
 }
