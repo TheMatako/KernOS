@@ -213,7 +213,7 @@ impl fmt::Write for SerialPort {
 /// We initialise this with `SerialPort::new` which is a `const unsafe fn` —
 /// no I/O port access happens here; the hardware is only touched when `init`
 /// is called from `kernel_main`.
-static mut SERIAL: SerialPort = unsafe { SerialPort::new(COM1_BASE) };
+pub static mut SERIAL: SerialPort = unsafe { SerialPort::new(COM1_BASE) };
 
 /// Initialises the global serial port.
 ///

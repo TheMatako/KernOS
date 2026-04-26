@@ -15,9 +15,10 @@
 //   6. VMM
 //   7. SLAB
 //   8. APIC
-//   9. Scheduler
-//  10. Enable interrupts  (STI — safe now that IDT is loaded)
-//  11. Spin (hlt loop)
+//   9. SCHEDULER
+//  10. SYSCALL
+//  11. Enable interrupts  (STI — safe now that IDT is loaded)
+//  12. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -41,6 +42,7 @@ mod pmm;
 mod scheduler;
 mod serial;
 mod slab;
+mod syscall;
 mod vmm;
 
 use shared::BootInfo;
@@ -95,6 +97,44 @@ macro_rules! kprint {
 macro_rules! kprintln {
     () => ($crate::kprint!("\n"));
     ($($arg:tt)*) => ($crate::kprint!("{}\n", format_args!($($arg)*)));
+}
+
+/// Demo user-mode task entry point.
+///
+/// This function will be jumped to from ring 3 via `iretq`.
+/// It uses the `syscall` instruction to communicate with the kernel.
+///
+/// Calling convention from ring 3 (Linux ABI):
+///   RAX = syscall number
+///   RDI, RSI = arguments
+unsafe extern "C" fn user_task_entry() -> ! {
+    // sys_write(buf, len) — write "Hello from ring 3!\n" to serial.
+    let msg = b"Hello from ring 3!\n";
+    core::arch::asm!(
+        "syscall",
+        in("rax") syscall::SYS_WRITE,
+        in("rdi") msg.as_ptr() as u64,
+        in("rsi") msg.len() as u64,
+        // RCX and R11 are clobbered by the CPU on syscall/sysret.
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+
+    // sys_exit(0) — terminate.
+    core::arch::asm!(
+        "syscall",
+        in("rax") syscall::SYS_EXIT,
+        in("rdi") 0u64,
+        lateout("rcx") _,
+        lateout("r11") _,
+        options(nostack),
+    );
+
+    // Unreachable — sys_exit never returns.
+    loop {
+        core::arch::asm!("hlt", options(nomem, nostack));
+    }
 }
 
 /// First function called by the bootloader after it jumps to the kernel.
@@ -155,17 +195,35 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // ── 9. Scheduler ──────────────────────────────────────────────────────────
     unsafe { scheduler::init() };
 
-    kprintln!("Brick 5 complete — preemptive scheduler running.");
-    kprintln!("Enabling interrupts — APIC timer will drive context switches.");
+    // ── 10. Syscall ───────────────────────────────────────────────────────────
+    // Configures STAR / LSTAR / FMASK / EFER.SCE so that ring-3 tasks can
+    // use the `syscall` instruction to enter the kernel.
+    unsafe { syscall::init() };
 
-    // ── 10. Enable interrupts + spin ──────────────────────────────────────────
-    // From this point the APIC fires at ~100 Hz.  Each interrupt calls
-    // scheduler::tick() which round-robins between idle / task_a / task_b.
+    // ── 12. Enable interrupts ─────────────────────────────────────────────────
     x86_64::instructions::interrupts::enable();
 
-    // The idle task — just halts until the next interrupt.
-    loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
+    kprintln!("Brick 6 complete — syscall/sysret operational.");
+    kprintln!("Ring-3 entry demo: launching user_task_entry via iretq...");
+
+    // ── Demo: jump to ring-3 ──────────────────────────────────────────────────
+    //
+    // Allocate a small user stack (one frame from the PMM, identity-mapped
+    // in the first 4 GiB), then use iretq to drop to ring 3.
+    //
+    // In a complete OS this would be done inside the scheduler when dispatching
+    // a user-mode process for the first time (Brick 7).
+    unsafe {
+        let user_stack_phys = pmm::alloc_frame().expect("main: OOM for user stack");
+
+        // Stack top = base + 4 KiB (stacks grow downward).
+        let user_stack_top = user_stack_phys + pmm::FRAME_SIZE;
+
+        // `user_task_entry` is currently a kernel function address.
+        // In a real OS it would live in a separate user address space;
+        // here it is identity-mapped (first 4 GiB) so the address is the same
+        // in both ring 0 and ring 3 — valid for this demo only.
+        syscall::jump_to_usermode(user_task_entry as *const () as u64, user_stack_top);
     }
 }
 

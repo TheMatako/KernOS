@@ -321,7 +321,7 @@ impl Scheduler {
     }
 
     /// Returns a mutable reference to the currently running task.
-    unsafe fn current_task_mut(&mut self) -> Option<&mut Task> {
+    pub unsafe fn current_task_mut(&mut self) -> Option<&mut Task> {
         if self.len == 0 {
             return None;
         }

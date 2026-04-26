@@ -279,7 +279,7 @@ unsafe fn ensure_table(entry: &mut PageTableEntry) -> PhysAddr {
         let table_phys = alloc_table();
         entry.set_addr(
             table_phys,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE,
         );
         table_phys
     }
@@ -349,7 +349,8 @@ pub fn flush_tlb_all() {
 pub unsafe fn init(installed_ram: u64) {
     let pml4 = &mut PML4.0;
 
-    let kernel_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    let kernel_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     // ── A) Identity map first 4 GiB (2 MiB huge pages) ───────────────────────
     //

@@ -33,8 +33,34 @@
 // stack, a #DF caused by a kernel stack overflow would immediately triple-fault
 // (the CPU would try to push the exception frame onto the exhausted stack,
 // fault again, and then give up and reset).
+//
+// The `syscall`/`sysret` instructions derive segment selectors from the STAR
+// MSR using fixed arithmetic:
+//
+//   SYSCALL  → CS = STAR[47:32],     SS = STAR[47:32] + 8
+//   SYSRET64 → SS = STAR[63:48] + 8, CS = STAR[63:48] + 16
+//
+// To satisfy both equations simultaneously we need:
+//
+//   kernel code  = 0x08   STAR[47:32]      = 0x08  → SS = 0x10 (kernel data ✓)
+//   kernel data  = 0x10
+//   user data    = 0x1B   STAR[63:48]      = 0x13  → SS = 0x1B (user data  ✓)
+//   user code    = 0x23                            → CS = 0x23 (user code  ✓)
+//   TSS low      = 0x28
+//   TSS high     = 0x30  (16-byte TSS descriptor occupies two slots)
+//
+// Index | Offset | Descriptor      | Selector (RPL)
+// ──────┼────────┼─────────────────┼────────────────
+//   0   |  0x00  | Null            | —
+//   1   |  0x08  | Kernel code 64  | 0x08  (RPL=0)
+//   2   |  0x10  | Kernel data     | 0x10  (RPL=0)
+//   3   |  0x18  | User data       | 0x1B  (RPL=3)
+//   4   |  0x20  | User code 64    | 0x23  (RPL=3)
+//   5   |  0x28  | TSS low         | 0x28
+//   6   |  0x30  | TSS high        | —
 
 #![allow(static_mut_refs)]
+#![allow(dead_code)]
 
 use core::mem::MaybeUninit;
 use core::ptr::addr_of;
@@ -52,10 +78,30 @@ use x86_64::{
 // Public constants
 // ---------------------------------------------------------------------------
 
-/// Index into the TSS Interrupt Stack Table used by the #DF handler.
-/// Valid range: 0–6 (7 IST slots exist).
-/// The IDT entry for #DF must reference the same index.
+// ---------------------------------------------------------------------------
+// Public constants — consumed by syscall.rs (STAR MSR)
+// ---------------------------------------------------------------------------
+
+/// IST index used by the #DF handler (0-based in the x86_64 crate array).
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+
+/// Kernel code segment selector (RPL=0).  STAR[47:32].
+pub const KCODE_SELECTOR: u16 = 0x08;
+
+/// Kernel data segment selector (RPL=0).  SS on syscall entry.
+pub const KDATA_SELECTOR: u16 = 0x10;
+
+/// User data segment selector (RPL=3).
+/// SYSRET sets SS = STAR[63:48] + 8 = 0x13 + 8 = 0x1B.
+pub const UDATA_SELECTOR: u16 = 0x1B;
+
+/// User code segment selector (RPL=3).
+/// SYSRET sets CS = STAR[63:48] + 16 = 0x13 + 16 = 0x23.
+pub const UCODE_SELECTOR: u16 = 0x23;
+
+/// Value written into STAR[63:48] to produce the right user selectors on SYSRET.
+/// 0x1B - 8 = 0x13.
+pub const STAR_USER_BASE: u16 = 0x13;
 
 // ---------------------------------------------------------------------------
 // Private constants
@@ -75,7 +121,6 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
 /// `#[repr(align(16))]` ensures 16-byte stack alignment as required by the
 /// System V AMD64 ABI (the CPU also mandates 16-byte alignment for RSP on
 /// exception entry when using an IST entry).
-#[allow(dead_code)]
 #[repr(align(16))]
 struct AlignedStack([u8; DOUBLE_FAULT_STACK_SIZE]);
 
@@ -116,14 +161,13 @@ static mut SELECTORS: MaybeUninit<KernelSelectors> = MaybeUninit::uninit();
 /// A `SegmentSelector` is a 16-bit value: the top 13 bits are the GDT index,
 /// bit 2 is the Table Indicator (0 = GDT), bits 1:0 are the RPL (Requested
 /// Privilege Level).
+/// All segment selectors produced by `init()`.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelSelectors {
-    /// Points to the 64-bit kernel code descriptor (ring 0, executable).
-    pub code: SegmentSelector,
-    /// Points to the kernel data descriptor (ring 0, read/write).
-    pub data: SegmentSelector,
-    /// Points to the TSS descriptor (used only by `ltr`; not reloaded afterwards).
-    #[allow(dead_code)]
+    pub kcode: SegmentSelector,
+    pub kdata: SegmentSelector,
+    pub udata: SegmentSelector,
+    pub ucode: SegmentSelector,
     pub tss: SegmentSelector,
 }
 
@@ -168,24 +212,24 @@ pub fn init() {
         // IST indices in the TSS are 1-based in the hardware spec but the
         // x86_64 crate uses a 0-based array; index 0 → IST1 in hardware.
         TSS.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = VirtAddr::new(stack_top);
-
+        TSS.privilege_stack_table[0] = VirtAddr::new(stack_top);
         // ── Step 2 — Add descriptors to the GDT ──────────────────────────────
         //
         // `append` appends the descriptor and returns the corresponding
         // SegmentSelector.  The null descriptor at index 0 is already present.
-        let code_sel = GDT.append(Descriptor::kernel_code_segment());
-        let data_sel = GDT.append(Descriptor::kernel_data_segment());
-
-        // `Descriptor::tss_segment` builds the 16-byte (2-slot) TSS descriptor.
-        // It stores a raw pointer to `TSS`, so TSS must not move — since it is
-        // a `static`, it never will.
-        let tss_sel = GDT.append(Descriptor::tss_segment(&TSS));
+        let kcode = GDT.append(Descriptor::kernel_code_segment()); // 0x08
+        let kdata = GDT.append(Descriptor::kernel_data_segment()); // 0x10
+        let udata = GDT.append(Descriptor::user_data_segment()); // 0x1B (RPL=3 set by crate)
+        let ucode = GDT.append(Descriptor::user_code_segment()); // 0x23 (RPL=3)
+        let tss = GDT.append(Descriptor::tss_segment(&TSS)); // 0x28+0x30
 
         // Persist the selectors for later use.
         SELECTORS.write(KernelSelectors {
-            code: code_sel,
-            data: data_sel,
-            tss: tss_sel,
+            kcode,
+            kdata,
+            udata,
+            ucode,
+            tss,
         });
 
         // ── Step 3 — Load the GDT (`lgdt`) ───────────────────────────────────
@@ -199,14 +243,14 @@ pub fn init() {
         //
         // CS cannot be set with a simple `mov`; a far jump or far return is
         // required.  The x86_64 crate handles this correctly with a `retfq`.
-        CS::set_reg(code_sel);
+        CS::set_reg(kcode);
 
         // DS, ES, SS accept a plain `mov reg, sel`.
         // FS and GS are reserved for thread-local storage / per-CPU data
         // (future bricks); we leave them as 0 (null selector) for now.
-        DS::set_reg(data_sel);
-        ES::set_reg(data_sel);
-        SS::set_reg(data_sel);
+        DS::set_reg(kdata);
+        ES::set_reg(kdata);
+        SS::set_reg(kdata);
 
         // ── Step 5 — Load the TSS (`ltr`) ────────────────────────────────────
         //
@@ -214,14 +258,14 @@ pub fn init() {
         // Task Register.  The CPU then knows where to find our IST stacks when
         // dispatching exceptions.  Must be called *after* `lgdt` and *after*
         // the GDT entry for the TSS has been populated.
-        load_tss(tss_sel);
+        load_tss(tss);
     }
 
     crate::kprintln!(
-        "[GDT] loaded — code={:#x} data={:#x}  DF stack @ [{:#x}..{:#x}]",
-        selectors().code.0,
-        selectors().data.0,
-        addr_of!(DOUBLE_FAULT_STACK) as u64,
-        addr_of!(DOUBLE_FAULT_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64,
+        "[GDT] loaded — kcode={:#x} kdata={:#x} ucode={:#x} udata={:#x}",
+        KCODE_SELECTOR,
+        KDATA_SELECTOR,
+        UCODE_SELECTOR,
+        UDATA_SELECTOR,
     );
 }
