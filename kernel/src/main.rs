@@ -5,7 +5,7 @@
 // This is the kernel entry point.
 // The bootloader loads this file and jumps to kernel_main().
 //
-// Brick 1, 2, 3 and 4
+// Brick 1 -> 8
 // Execution order in `kernel_main`:
 //   1. Zero BSS           (mandatory — must be first)
 //   2. Serial (UART)      (our only debug output)
@@ -15,11 +15,12 @@
 //   6. VMM
 //   7. SLAB
 //   8. DRIVERS            (keyboard + PCI + block)
-//   9. APIC
-//  10. SCHEDULER
-//  11. SYSCALL
-//  12. Enable interrupts  (STI — safe now that IDT is loaded)
-//  13. Spin (hlt loop)
+//   9. VFS                (KernFS sur "/")
+//  10. APIC
+//  11. SCHEDULER
+//  12. SYSCALL
+//  13. Enable interrupts  (STI — safe now that IDT is loaded)
+//  14. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -32,6 +33,7 @@
 #![no_main]
 // Required by the x86_64 crate's `extern "x86-interrupt"` calling convention.
 #![feature(abi_x86_interrupt)]
+#![allow(static_mut_refs)]
 
 // ------------------------------------------------------------
 // Kernel Entry Point
@@ -45,6 +47,7 @@ mod scheduler;
 mod serial;
 mod slab;
 mod syscall;
+mod vfs;
 mod vmm;
 
 use shared::BootInfo;
@@ -100,6 +103,13 @@ macro_rules! kprintln {
     () => ($crate::kprint!("\n"));
     ($($arg:tt)*) => ($crate::kprint!("{}\n", format_args!($($arg)*)));
 }
+
+// ---------------------------------------------------------------------------
+// Static Instance of the filesystem — must survive for as long as the VFS
+// ---------------------------------------------------------------------------
+
+static mut KERNFS_INSTANCE: core::mem::MaybeUninit<vfs::kernfs::KernFs> =
+    core::mem::MaybeUninit::uninit();
 
 /// First function called by the bootloader after it jumps to the kernel.
 ///
@@ -160,9 +170,6 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     const RAM_DISK_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
     unsafe { drivers::init(RAM_DISK_SIZE) };
 
-    // Validate the block driver before the VFS uses it.
-    unsafe { drivers::block::smoke_test() };
-
     // Print discovered PCI devices.
     kprintln!("[PCI]  device list:");
     for dev in drivers::pci::devices() {
@@ -177,25 +184,34 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         );
     }
 
-    // ── 9. APIC timer ─────────────────────────────────────────────────────────
+    // ── 9. VFS + KernFS ────────────────────────────────────────────────────────
+    unsafe {
+        // Initialiser KernFS (crée la racine, l'arborescence de base, motd).
+        let fs = vfs::kernfs::init();
+        KERNFS_INSTANCE.write(fs);
+
+        // Monter KernFS sur "/" dans la table de montage VFS.
+        vfs::mount("/", KERNFS_INSTANCE.as_mut_ptr());
+    }
+
+    // ── 10. APIC timer ─────────────────────────────────────────────────────────
     // Must be called BEFORE scheduler::init() so the timer is ticking when
     // we enable interrupts.  The IDT handler (idt.rs) will call scheduler::tick()
     // on every timer interrupt.
     unsafe { apic::init() };
 
-    // ── 10. Scheduler ──────────────────────────────────────────────────────────
+    // ── 11. Scheduler ──────────────────────────────────────────────────────────
     unsafe { scheduler::init() };
 
-    // ── 11. Syscall ───────────────────────────────────────────────────────────
+    // ── 12. Syscall ───────────────────────────────────────────────────────────
     // Configures STAR / LSTAR / FMASK / EFER.SCE so that ring-3 tasks can
     // use the `syscall` instruction to enter the kernel.
     unsafe { syscall::init() };
 
-    // ── 12. Enable interrupts ─────────────────────────────────────────────────
+    // ── 13. Enable interrupts ─────────────────────────────────────────────────
     x86_64::instructions::interrupts::enable();
 
-    kprintln!("Brick 7 complete — keyboard / PCI / block drivers operational.");
-
+    kprintln!("Brick 8 complete — KernFS VFS operational.");
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
