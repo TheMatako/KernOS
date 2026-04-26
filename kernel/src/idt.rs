@@ -56,20 +56,6 @@ use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 /// (0x20) to avoid collisions.
 pub const APIC_TIMER_VECTOR: u8 = 0x20;
 
-/// I/O port of the Local APIC EOI register.
-///
-/// Writing any value to this port signals "End Of Interrupt" to the APIC.
-/// Without EOI the APIC will not deliver any further interrupts at the same
-/// or lower priority.
-///
-/// Note: on x2APIC systems the EOI is a MSR write, not a port write.
-/// We use the legacy xAPIC MMIO-mapped version here; the MMIO address is
-/// 0xFEE0_00B0 but we access it via a raw pointer, not a Port.
-///
-/// For now we keep a simple port-based EOI path; the full APIC driver comes
-/// in a later brick.
-const APIC_EOI_MMIO: *mut u32 = 0xFEE0_00B0 as *mut u32;
-
 // ---------------------------------------------------------------------------
 // Static IDT
 // ---------------------------------------------------------------------------
@@ -396,15 +382,23 @@ extern "x86-interrupt" fn handler_cp_protection(frame: InterruptStackFrame, erro
 ///
 /// The full scheduler (Brick 5) will replace this with a proper tick handler.
 extern "x86-interrupt" fn handler_apic_timer(_frame: InterruptStackFrame) {
-    // Send EOI (End Of Interrupt) to the Local APIC.
+    // ── 1. Acknowledge the interrupt (EOI) ────────────────────────────────────
     //
-    // We write 0 to the MMIO-mapped EOI register at 0xFEE0_00B0.
-    // Without this the APIC will not deliver any further interrupts.
+    // Send End Of Interrupt to the Local APIC *before* calling the scheduler.
+    // If we sent EOI after the context switch we might never reach it
+    // (the CPU would be running a different task).
     //
-    // Safety: 0xFEE0_00B0 is the architecturally-defined MMIO address of the
-    // Local APIC EOI register on every x86 system.  Writing 0 is the correct
-    // EOI protocol (any other value is architecturally reserved).
-    unsafe {
-        core::ptr::write_volatile(APIC_EOI_MMIO, 0);
-    }
+    // Safety: apic::eoi() writes to APIC MMIO — valid in ring 0.
+    unsafe { crate::apic::eoi() };
+
+    // ── 2. Call the scheduler ─────────────────────────────────────────────────
+    //
+    // `scheduler::tick()` increments the tick counter and may perform a context
+    // switch (switch_context).  If a switch occurs, this handler "returns" into
+    // a different task's stack — but that is fine because the interrupt frame
+    // was already saved by the CPU before we entered this handler.
+    //
+    // Safety: we are inside an interrupt handler — IF is already cleared by the
+    // CPU, so no nested timer interrupt can fire during the switch.
+    unsafe { crate::scheduler::tick() };
 }
