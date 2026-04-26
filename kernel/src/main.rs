@@ -14,8 +14,10 @@
 //   5. PMM
 //   6. VMM
 //   7. SLAB
-//   8. Enable interrupts  (STI — safe now that IDT is loaded)
-//   9. Spin (hlt loop)
+//   8. APIC
+//   9. Scheduler
+//  10. Enable interrupts  (STI — safe now that IDT is loaded)
+//  11. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -32,9 +34,11 @@
 // ------------------------------------------------------------
 // Kernel Entry Point
 // ------------------------------------------------------------
+mod apic;
 mod gdt;
 mod idt;
 mod pmm;
+mod scheduler;
 mod serial;
 mod slab;
 mod vmm;
@@ -142,13 +146,24 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // ── 7. Slab allocator ─────────────────────────────────────────────────────
     slab::init();
 
-    // ── 8. Enable interrupts ──────────────────────────────────────────────────
-    // Safety: IDT is fully loaded; safe to unmask hardware IRQs.
+    // ── 8. APIC timer ─────────────────────────────────────────────────────────
+    // Must be called BEFORE scheduler::init() so the timer is ticking when
+    // we enable interrupts.  The IDT handler (idt.rs) will call scheduler::tick()
+    // on every timer interrupt.
+    unsafe { apic::init() };
+
+    // ── 9. Scheduler ──────────────────────────────────────────────────────────
+    unsafe { scheduler::init() };
+
+    kprintln!("Brick 5 complete — preemptive scheduler running.");
+    kprintln!("Enabling interrupts — APIC timer will drive context switches.");
+
+    // ── 10. Enable interrupts + spin ──────────────────────────────────────────
+    // From this point the APIC fires at ~100 Hz.  Each interrupt calls
+    // scheduler::tick() which round-robins between idle / task_a / task_b.
     x86_64::instructions::interrupts::enable();
 
-    kprintln!("Brick 4 complete - VMM operational.");
-
-    // ── 9. Spin forever ───────────────────────────────────────────────────────
+    // The idle task — just halts until the next interrupt.
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
