@@ -11,6 +11,7 @@
 #![allow(static_mut_refs)]
 
 pub mod block;
+pub mod e1000;
 pub mod keyboard;
 pub mod pci;
 
@@ -26,4 +27,5 @@ pub unsafe fn init(ram_disk_size_bytes: usize) {
     keyboard::init();
     pci::init();
     block::init(ram_disk_size_bytes);
+    e1000::init();
 }
