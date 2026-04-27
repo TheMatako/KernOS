@@ -68,10 +68,13 @@ run: build
 
 	@echo "[KernOS] Launching QEMU..."
 	qemu-system-x86_64 \
+		-bios $(OVMF) \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF) \
 		-drive format=raw,file=$(IMG) \
 		-m 256M \
 		-name "KernOS" \
+		-netdev user,id=net0,hostfwd=tcp::8080-:80 \
+		-device e1000,netdev=net0 \
 		-nographic
 
 

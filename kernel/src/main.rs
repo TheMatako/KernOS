@@ -14,13 +14,14 @@
 //   5. PMM
 //   6. VMM
 //   7. SLAB
-//   8. DRIVERS            (keyboard + PCI + block)
-//   9. VFS                (KernFS sur "/")
-//  10. APIC
-//  11. SCHEDULER
-//  12. SYSCALL
-//  13. Enable interrupts  (STI — safe now that IDT is loaded)
-//  14. Spin (hlt loop)
+//   8. DRIVERS            (keyboard + PCI + block + e1000)
+//   9. NET
+//  10. VFS                (KernFS sur "/")
+//  11. APIC
+//  12. SCHEDULER
+//  13. SYSCALL
+//  14. Enable interrupts  (STI — safe now that IDT is loaded)
+//  15. Spin (hlt loop)
 //
 // Language : Rust (no_std, no_main)
 // Target   : x86_64-unknown-none
@@ -42,6 +43,7 @@ mod apic;
 mod drivers;
 mod gdt;
 mod idt;
+mod net;
 mod pmm;
 mod scheduler;
 mod serial;
@@ -184,7 +186,12 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         );
     }
 
-    // ── 9. VFS + KernFS ────────────────────────────────────────────────────────
+    drivers::e1000::init();
+
+    // ── 9. Réseau ────────────────────────────────────────────────────────────────
+    unsafe { net::init() };
+
+    // ── 10. VFS + KernFS ────────────────────────────────────────────────────────
     unsafe {
         // Initialiser KernFS (crée la racine, l'arborescence de base, motd).
         let fs = vfs::kernfs::init();
@@ -194,24 +201,24 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         vfs::mount("/", KERNFS_INSTANCE.as_mut_ptr());
     }
 
-    // ── 10. APIC timer ─────────────────────────────────────────────────────────
+    // ── 11. APIC timer ─────────────────────────────────────────────────────────
     // Must be called BEFORE scheduler::init() so the timer is ticking when
     // we enable interrupts.  The IDT handler (idt.rs) will call scheduler::tick()
     // on every timer interrupt.
     unsafe { apic::init() };
 
-    // ── 11. Scheduler ──────────────────────────────────────────────────────────
+    // ── 12. Scheduler ──────────────────────────────────────────────────────────
     unsafe { scheduler::init() };
 
-    // ── 12. Syscall ───────────────────────────────────────────────────────────
+    // ── 13. Syscall ───────────────────────────────────────────────────────────
     // Configures STAR / LSTAR / FMASK / EFER.SCE so that ring-3 tasks can
     // use the `syscall` instruction to enter the kernel.
     unsafe { syscall::init() };
 
-    // ── 13. Enable interrupts ─────────────────────────────────────────────────
+    // ── 14. Enable interrupts ─────────────────────────────────────────────────
     x86_64::instructions::interrupts::enable();
+    kprintln!("Brick 9 complete — TCP/IP stack + e1000 NIC operational.");
 
-    kprintln!("Brick 8 complete — KernFS VFS operational.");
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)) };
     }
