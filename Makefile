@@ -75,7 +75,9 @@ run: build
 		-name "KernOS" \
 		-netdev user,id=net0,hostfwd=tcp::8080-:80 \
 		-device e1000,netdev=net0 \
-		-nographic
+		-serial stdio \
+		-vnc :0 \
+		-k fr
 
 
 # ------------------------------------------------------------
