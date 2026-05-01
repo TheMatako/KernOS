@@ -294,13 +294,13 @@ pub struct Scheduler {
     ///
     /// We use raw pointers because the tasks are heap-allocated (or static)
     /// and we need stable addresses.  Indices are valid in `[0, len)`.
-    tasks: [*mut Task; MAX_TASKS],
+    pub tasks: [*mut Task; MAX_TASKS],
 
     /// Number of tasks registered (including idle).
-    len: usize,
+    pub len: usize,
 
     /// Index of the currently running task in `tasks`.
-    current: usize,
+    pub current: usize,
 
     /// Total scheduler ticks since boot.
     ticks: u64,
