@@ -48,10 +48,10 @@ const ARP_PKT_LEN: usize = core::mem::size_of::<ArpPacket>(); // 28
 const ARP_CACHE_SIZE: usize = 16;
 
 #[derive(Clone, Copy, Default)]
-struct ArpEntry {
-    ip: [u8; 4],
-    mac: [u8; 6],
-    valid: bool,
+pub struct ArpEntry {
+    pub ip: [u8; 4],
+    pub mac: [u8; 6],
+    pub valid: bool,
 }
 
 static mut ARP_CACHE: [ArpEntry; ARP_CACHE_SIZE] = [ArpEntry {
@@ -245,4 +245,9 @@ pub unsafe fn resolve(ip: [u8; 4]) -> Option<[u8; 6]> {
         core::hint::spin_loop();
     }
     None
+}
+
+/// Expose le cache ARP en lecture seule pour le shell (commande netstat).
+pub fn arp_cache_entries() -> &'static [ArpEntry; ARP_CACHE_SIZE] {
+    unsafe { &ARP_CACHE }
 }
