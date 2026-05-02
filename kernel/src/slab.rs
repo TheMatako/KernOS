@@ -180,9 +180,12 @@ impl SlabCache {
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
         );
 
-        // 4. Zero the page (it may contain garbage from a previous free).
-        ptr::write_bytes(virt.as_u64() as *mut u8, 0u8, PAGE_SIZE);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        unsafe {
+            core::arch::asm!("mfence", options(nostack));
+        }
 
+        ptr::write_bytes(virt.as_u64() as *mut u8, 0u8, PAGE_SIZE);
         // 5. Write the slab header at byte 0.
         let obj_size = self.object_size;
 
