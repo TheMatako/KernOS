@@ -19,7 +19,7 @@
 // ── Minimalist Readline ──────────────────────────────────────────────────────
 //
 // `readline()` processes characters individually as they arrive:
-// - Backspace (0x08 / 0x7F) : Visually and logically erases the last character.
+// - Backspace (0x08 / 0x7F) : Visually AND logically erases the last character.
 // - Enter (0x0D / 0x0A)     : Submits the line.
 // - Ctrl-C (0x03)           : Cancels the current line input.
 // - Ctrl-L (0x0C)           : Clears the screen (ANSI escape).
@@ -72,21 +72,29 @@ fn readline(buf: &mut [u8; LINE_MAX]) -> usize {
 
             // ── Backspace (Delete) ───────────────────────────────────────────
             0x08 | 0x7F if pos > 0 => {
+                // 1. Logically erase the character from our input buffer
                 pos -= 1;
-                kprint!("\x08 \x08");
+                buf[pos] = 0; // Prevent garbage data
+
+                // 2. Visually erase the character from the screen
+                unsafe {
+                    crate::drivers::framebuffer::backspace();
+                }
             }
 
             // ── Ctrl-C : Cancel Input ────────────────────────────────────────
             0x03 => {
                 kprintln!("^C");
-                return 0;
+                return 0; // Return 0 length so the caller knows to restart
             }
 
             // ── Ctrl-L : Clear Screen ────────────────────────────────────────
             0x0C => {
                 // ANSI escape: [2J = clear screen, [H = cursor to top-left
                 kprint!("\x1b[2J\x1b[H");
-                // Reprint the prompt and the current buffer contents
+
+                // Reprint the prompt and the current buffer contents so the user
+                // doesn't lose what they were typing.
                 print_prompt();
                 kprint!("{}", core::str::from_utf8(&buf[..pos]).unwrap_or(""));
             }
@@ -103,8 +111,11 @@ fn readline(buf: &mut [u8; LINE_MAX]) -> usize {
 
             // ── Standard Printable Characters ────────────────────────────────
             c if (0x20..0x7F).contains(&c) && pos < LINE_MAX - 1 => {
+                // Add the character to our logical buffer
                 buf[pos] = c;
                 pos += 1;
+
+                // Print the character to the screen
                 kprint!("{}", c as char);
             }
 
@@ -167,7 +178,7 @@ pub fn run() -> ! {
     // Print the welcome banner.
     kprintln!();
     kprintln!("╔══════════════════════════════════════╗");
-    kprintln!("║         KernOS Shell v0.10           ║");
+    kprintln!("║        KernOS Shell v0.10            ║");
     kprintln!("║  Type 'help' for a list of           ║");
     kprintln!("║  available commands.                 ║");
     kprintln!("╚══════════════════════════════════════╝");
