@@ -157,6 +157,9 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     // ── 2. Initialize Serial Port ────────────────────────────────────────────
     unsafe { serial::init() };
+    if let Some(fb) = (*boot_info).framebuffer {
+        crate::drivers::framebuffer::init(fb);
+    }
 
     kprintln!("KernOS kernel starting...");
     kprintln!("boot_info @ {:p}", boot_info);
@@ -172,34 +175,71 @@ pub unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     idt::init();
 
     // ── 5. PMM (Physical Memory Management) ──────────────────────────────────
-    let memory_map = unsafe { &(*boot_info).memory_map };
-    unsafe { pmm::init(memory_map) };
+    unsafe { pmm::init(&(*boot_info)) };
     pmm::print_stats();
 
     // ── 6. VMM (Virtual Memory Management) ───────────────────────────────────
-    let installed_ram = pmm::total_usable_frames() as u64 * pmm::FRAME_SIZE;
-    unsafe { vmm::init(installed_ram) };
+    // ── X. Extraire les infos de l'écran pour le VMM ──────────────────────────
+    // ── X. Extraire les infos pour le VMM ──────────────────────────
+    let mut max_phys_addr: u64 = 0;
 
+    // On cherche l'adresse physique la plus lointaine déclarée par le BIOS
+    for region in (*boot_info).memory_map.valid_entries() {
+        let end = region.base + region.length;
+        if end > max_phys_addr {
+            max_phys_addr = end;
+        }
+    }
+
+    let fb_base = (*boot_info).framebuffer.map(|fb| fb.base);
+    let fb_size = (*boot_info)
+        .framebuffer
+        .map(|fb| fb.size as u64)
+        .unwrap_or(0);
+
+    // Initialiser le VMM avec la RAM et le Framebuffer
+
+    vmm::init(max_phys_addr, fb_base, fb_size);
+
+    let boot_info = unsafe {
+        let phys_addr = boot_info as *const _ as u64;
+        let virt_addr = phys_addr + vmm::RAM_DIRECT_MAP_BASE;
+        &*(virt_addr as *const shared::BootInfo) // Adapte "shared::BootInfo" si besoin
+    };
+
+    // ── X. Wipe the screen (Clear UEFI leftovers) ────────────────────────────
+    if let Some(fb) = boot_info.framebuffer {
+        unsafe {
+            // Attention : Si ton VMM ne fait pas de direct-mapping sur cette adresse,
+            // il faudra demander au VMM de mapper `fb.base` avant de faire ça !
+            let fb_ptr = fb.base as *mut u8;
+
+            // On remplit tout le framebuffer avec des 0 (Noir absolu)
+            core::ptr::write_bytes(fb_ptr, 0, fb.size);
+        }
+    }
     // ── 7. Slab Allocator ────────────────────────────────────────────────────
     slab::init();
-
+    unsafe {
+        drivers::framebuffer::enable_double_buffering();
+    }
     // ── 8. Drivers & Hardware ────────────────────────────────────────────────
     // Allocate 32 MiB of contiguous physical memory for the RAM disk.
     const RAM_DISK_SIZE: usize = 32 * 1024 * 1024;
     unsafe { drivers::init(RAM_DISK_SIZE) };
 
-    kprintln!("[PCI]  device list:");
-    for dev in drivers::pci::devices() {
-        kprintln!(
-            "  {:02x}:{:02x}.{}  {:04x}:{:04x}  {}",
-            dev.bus,
-            dev.slot,
-            dev.func,
-            dev.vendor_id,
-            dev.device_id,
-            dev.class_name(),
-        );
-    }
+    // kprintln!("[PCI]  device list:");
+    // for dev in drivers::pci::devices() {
+    //     kprintln!(
+    //         "  {:02x}:{:02x}.{}  {:04x}:{:04x}  {}",
+    //         dev.bus,
+    //         dev.slot,
+    //         dev.func,
+    //         dev.vendor_id,
+    //         dev.device_id,
+    //         dev.class_name(),
+    //     );
+    // }
 
     drivers::e1000::init();
 

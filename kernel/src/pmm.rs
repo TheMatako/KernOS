@@ -41,6 +41,7 @@
 
 #![allow(dead_code)]
 
+use shared::BootInfo;
 use shared::{MemoryMap, MemoryRegionKind};
 
 // ---------------------------------------------------------------------------
@@ -173,32 +174,34 @@ pub fn frame_to_addr(frame: usize) -> u64 {
 ///
 /// # Safety
 /// Writes to `static mut` globals. Must be called exactly once.
-pub unsafe fn init(memory_map: &MemoryMap) {
+/// Initialises the PMM from the bootloader memory map.
+pub unsafe fn init(boot_info: &BootInfo) {
     // ── Step 1 — Mark everything as USED (pessimistic baseline) ───────────────
-    //
-    // We fill every byte with 0xFF so that any frame not explicitly listed
-    // as Usable in the memory map stays permanently reserved.  This is safer
-    // than starting from "all free" and risking a missing reservation.
     #[allow(static_mut_refs)]
     for byte in BITMAP.iter_mut() {
         *byte = 0xFF;
     }
 
+    // ── NOUVEAU : Extraire les zones critiques à protéger ─────────────────────
+    let fb_start = boot_info.framebuffer.map(|f| f.base).unwrap_or(0);
+    let fb_end = boot_info
+        .framebuffer
+        .map(|f| f.base + f.size as u64)
+        .unwrap_or(0);
+
+    let kernel_start = boot_info.kernel_physical_start;
+    let kernel_end = kernel_start + boot_info.kernel_size;
+
     // ── Step 2 — Scan the memory map and free Usable regions ──────────────────
     let mut usable_frames: usize = 0;
 
-    for region in memory_map.valid_entries() {
+    for region in boot_info.memory_map.valid_entries() {
         match region.kind {
-            // Only Usable memory is available to the allocator.
             MemoryRegionKind::Usable => {
-                // Align the region inward to full frame boundaries.
-                // We round the start UP and the end DOWN so we never hand out
-                // a frame that partially overlaps a reserved area.
                 let start = align_up(region.base, FRAME_SIZE);
                 let end = align_down(region.base + region.length, FRAME_SIZE);
 
                 if start >= end {
-                    // Region too small to contain even one full frame.
                     continue;
                 }
 
@@ -206,21 +209,25 @@ pub unsafe fn init(memory_map: &MemoryMap) {
                 let last_frame = addr_to_frame(end - 1);
 
                 for frame in first_frame..=last_frame {
+                    let phys_addr = frame_to_addr(frame);
+
+                    // --- LA MAGIE EST ICI ---
+                    // 1. On interdit au PMM de donner la mémoire de l'écran (même si le BIOS dit qu'elle est libre)
+                    if phys_addr >= fb_start && phys_addr < fb_end {
+                        continue;
+                    }
+                    // 2. On interdit de toucher au kernel lui-même
+                    if phys_addr >= kernel_start && phys_addr < kernel_end {
+                        continue;
+                    }
+                    // ------------------------
+
                     mark_free(frame);
                     usable_frames += 1;
                 }
             }
 
-            // BootloaderReclaimable: currently USED, can be freed later once
-            // we have copied BootInfo into our own structures (Brick 4+).
-            // We leave these bits at 1 for now and expose `reclaim_bootloader()`
-            // below for when the caller is ready.
-            MemoryRegionKind::BootloaderReclaimable => {
-                // Left as USED — already set by the pessimistic baseline.
-            }
-
-            // Everything else (KernelCode, Reserved, UefiRuntime, …):
-            // stays USED.
+            MemoryRegionKind::BootloaderReclaimable => {}
             _ => {}
         }
     }

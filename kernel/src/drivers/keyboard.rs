@@ -53,6 +53,11 @@ const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 /// Capacity of the ASCII ring buffer (must be a power of two).
 const BUF_SIZE: usize = 256;
 
+/// Tracks the state of modifier keys.
+static mut KB_SHIFT: bool = false;
+static mut KB_CTRL: bool = false;
+static mut KB_ALTGR: bool = false;
+
 /// Circular byte buffer for decoded ASCII characters.
 struct RingBuffer {
     buf: [u8; BUF_SIZE],
@@ -142,34 +147,104 @@ static mut KB_EXTENDED: bool = false;
 /// Must be called only from the keyboard IRQ handler (interrupts masked).
 pub unsafe fn handle_irq() {
     let mut data_port: Port<u8> = Port::new(PS2_DATA);
-
-    // Read the scancode byte from the controller.
     let scancode: u8 = data_port.read();
 
-    // ── Extended sequence prefix ───────────────────────────────────────────────
+    // 1. Handle Extended Sequence (0xE0 prefix)
     if scancode == 0xE0 {
-        // The next byte is the actual extended scancode.  We set a flag and
-        // return; the following IRQ will see the flag and skip the byte.
         KB_EXTENDED = true;
         return;
     }
 
+    // 2. Handle Modifiers (Shift, Ctrl, AltGr)
+    match scancode {
+        // --- SHIFT ---
+        0x2A | 0x36 => {
+            KB_SHIFT = true;
+            return;
+        } // Pressed
+        0xAA | 0xB6 => {
+            KB_SHIFT = false;
+            return;
+        } // Released
+
+        // --- CTRL ---
+        0x1D => {
+            KB_CTRL = true;
+            return;
+        } // Pressed
+        0x9D => {
+            KB_CTRL = false;
+            return;
+        } // Released
+
+        // --- ALT GR (E0 38) ---
+        0x38 if KB_EXTENDED => {
+            KB_ALTGR = true;
+            KB_EXTENDED = false; // Reset here since we handled it
+            return;
+        }
+        0xB8 if KB_EXTENDED => {
+            KB_ALTGR = false;
+            KB_EXTENDED = false; // Reset here since we handled it
+            return;
+        }
+
+        _ => {}
+    }
+
+    // 3. Skip remaining extended bytes (arrows, etc.) if not handled above
     if KB_EXTENDED {
-        // Skip extended key bytes (arrows, numpad enter, etc.) for now.
-        // A full driver would decode them here (e.g. 0xE0 0x48 = arrow up).
         KB_EXTENDED = false;
         return;
     }
 
-    // ── Break code (key release): bit 7 set → ignore ──────────────────────────
+    // 4. Break code (key release) -> ignore
     if scancode & 0x80 != 0 {
         return;
     }
 
-    // ── Decode make code → ASCII ──────────────────────────────────────────────
+    // 5. Decode Make Code
     let idx = scancode as usize;
     if idx < SCANCODE_TO_ASCII.len() {
-        let ascii = SCANCODE_TO_ASCII[idx];
+        let mut ascii = SCANCODE_TO_ASCII[idx];
+
+        // --- LAYER: SHIFT (Numbers & Punctuation) ---
+        if KB_SHIFT {
+            ascii = match scancode {
+                0x02..=0x0B => b"1234567890"[idx - 0x02], // Range 0x02 to 0x0B
+                0x33 => b'.', // Shift + ',' = '.' (Very important for IPs!)
+                0x34 => b'/', // Shift + ';' = '/'
+                0x35 => b'?', // Shift + ':' = '?'
+                0x0C => 176,  // Degree symbol °
+                0x0D => b'+',
+                _ if ascii.is_ascii_lowercase() => ascii - 32,
+                _ => ascii,
+            };
+        }
+        // --- LAYER: ALTGR (Special symbols) ---
+        else if KB_ALTGR {
+            ascii = match scancode {
+                0x03 => b'~',
+                0x04 => b'#',
+                0x05 => b'{',
+                0x06 => b'[',
+                0x07 => b'|',
+                0x08 => b'`',
+                0x09 => b'\\',
+                0x0A => b'^',
+                0x0B => b'@',
+                0x0C => b']',
+                0x0D => b'}',
+                _ => 0,
+            };
+        }
+
+        // --- LAYER: CONTROL (ASCII Control Codes) ---
+        // If Ctrl is held, translate 'a'-'z' to 1-26
+        if KB_CTRL && (ascii.to_ascii_lowercase()).is_ascii_lowercase() {
+            ascii = ascii.to_ascii_lowercase() - b'a' + 1;
+        }
+
         if ascii != 0 {
             KB_BUF.push(ascii);
         }
@@ -226,5 +301,5 @@ pub unsafe fn init() {
         let _ = data_port.read();
     }
 
-    crate::kprintln!("[KBD]  PS/2 keyboard driver ready (IRQ 1, scancode set 1, US-QWERTY)");
+    crate::kprintln!("[KBD]  PS/2 keyboard driver ready (IRQ 1, scancode set 1, AZERTY-FR)");
 }

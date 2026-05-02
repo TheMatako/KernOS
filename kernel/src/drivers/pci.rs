@@ -263,16 +263,16 @@ unsafe fn register_device(bus: u8, slot: u8, func: u8) {
         dev.bars[i] = config_read32(bus, slot, func, off);
     }
 
-    crate::kprintln!(
-        "[PCI]  {:02x}:{:02x}.{}  {:04x}:{:04x}  {}  IRQ={}",
-        bus,
-        slot,
-        func,
-        dev.vendor_id,
-        dev.device_id,
-        dev.class_name(),
-        dev.irq_line,
-    );
+    //crate::kprintln!(
+    //    "[PCI]  {:02x}:{:02x}.{}  {:04x}:{:04x}  {}  IRQ={}",
+    //    bus,
+    //    slot,
+    //    func,
+    //    dev.vendor_id,
+    //    dev.device_id,
+    //    dev.class_name(),
+    //    dev.irq_line,
+    //);
 
     let idx = unsafe { DEVICE_COUNT };
     unsafe {

@@ -12,3 +12,4 @@ path = "src/main.rs"
 [dependencies]
 shared = { version = "0.1.0", path = "../shared" }
 x86_64 = { version = "0.15", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
+font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }

@@ -12,9 +12,9 @@
 
 pub mod block;
 pub mod e1000;
+pub mod framebuffer;
 pub mod keyboard;
 pub mod pci;
-
 /// Initialises all drivers in the correct order.
 ///
 /// Call order in `kernel_main` (after idt::init, before scheduler::init):

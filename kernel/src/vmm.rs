@@ -22,7 +22,7 @@
 //   0x0000_0000_0000_0000 – 0x0000_0000_001F_FFFF  : first 2 MiB (identity)
 //   0x0000_0000_0010_0000 – …                       : kernel code (1 MiB phys)
 //   KERNEL_HEAP_START – KERNEL_HEAP_START + HEAP_SIZE : kernel heap (slab)
-//   RAM_DIRECT_MAP_BASE  – +installed_ram            : direct physical map
+//   RAM_DIRECT_MAP_BASE  – +max_phys_addr            : direct physical map
 //                                                      (huge pages, 2 MiB each)
 //
 // The direct physical map lets the kernel address any physical frame by:
@@ -42,9 +42,9 @@
 #![allow(dead_code)]
 #![allow(static_mut_refs)]
 
-use core::ptr;
 use x86_64::{
     registers::control::{Cr3, Cr3Flags},
+    registers::model_specific::{Efer, EferFlags},
     structures::paging::{
         page_table::PageTableEntry, PageTable, PageTableFlags, PhysFrame, Size4KiB,
     },
@@ -88,6 +88,16 @@ pub const KERNEL_HEAP_SIZE: u64 = 512 * 1024 * 1024;
 struct AlignedPageTable(PageTable);
 
 static mut PML4: AlignedPageTable = AlignedPageTable(PageTable::new());
+
+static mut VMM_ACTIVE: bool = false;
+
+unsafe fn get_table_ptr(phys: PhysAddr) -> *mut u8 {
+    if VMM_ACTIVE {
+        phys_to_virt(phys).as_mut_ptr()
+    } else {
+        phys.as_u64() as *mut u8
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Internal: physical address of a page table we own
@@ -145,12 +155,12 @@ pub fn virt_to_phys(virt: VirtAddr) -> PhysAddr {
 /// # Safety
 /// Calls `pmm::alloc_frame()`. Returns a physical address.
 unsafe fn alloc_table() -> PhysAddr {
-    let phys = pmm::alloc_frame().expect("VMM: out of physical memory while allocating page table");
+    let phys = pmm::alloc_frame().expect("VMM: out of physical memory");
+    let virt = get_table_ptr(PhysAddr::new(phys)) as *mut u64; // On travaille en u64 (8 octets)
 
-    // Zero the new table.  During early boot (before the direct map is live)
-    // physical == virtual, so this pointer arithmetic works.
-    let virt = phys as *mut u8;
-    ptr::write_bytes(virt, 0u8, 4096);
+    for i in 0..512 {
+        core::ptr::write_volatile(virt.add(i), 0);
+    }
 
     PhysAddr::new(phys)
 }
@@ -163,7 +173,7 @@ unsafe fn alloc_table() -> PhysAddr {
 /// # Safety
 /// `phys` must point to a valid, properly aligned 4 KiB page table frame.
 unsafe fn table_at(phys: PhysAddr) -> &'static mut PageTable {
-    &mut *(phys.as_u64() as *mut PageTable)
+    &mut *(get_table_ptr(phys) as *mut PageTable) // Traduction sécurisée
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +195,11 @@ unsafe fn table_at(phys: PhysAddr) -> &'static mut PageTable {
 /// - `virt` and `phys` must be 4 KiB-aligned.
 /// - Caller must flush the TLB if the mapping replaces an existing one.
 pub unsafe fn map_4k(pml4: &mut PageTable, virt: VirtAddr, phys: PhysAddr, flags: PageTableFlags) {
+    assert!(
+        phys.as_u64().is_multiple_of(4096),
+        "VMM: PhysAddr {:#x} non alignée sur 4K",
+        phys.as_u64()
+    );
     // ── Decompose the virtual address into table indices ─────────────────────
     // VirtAddr::p4_index() etc. give us the 9-bit index at each level.
     let p4_idx = virt.p4_index(); // bits [47:39]
@@ -336,17 +351,20 @@ pub fn flush_tlb_all() {
 ///
 /// Call order in `kernel_main`:
 ///   1–4. BSS / serial / GDT / IDT / PMM
-///   5. **`vmm::init(installed_ram_bytes)`**
+///   5. **`vmm::init(max_phys_addr_bytes)`**
 ///
 /// # Arguments
-/// * `installed_ram` — total physical RAM in bytes (from PMM stats or BootInfo).
+/// * `max_phys_addr` — total physical RAM in bytes (from PMM stats or BootInfo).
 ///   Rounded up internally to the nearest 2 MiB boundary.
 ///
 /// # Safety
 /// Loads a new CR3.  After this call the old UEFI mapping is gone; do not
 /// access any UEFI-provided pointer unless it is within the first 4 GiB or
 /// the direct map.
-pub unsafe fn init(installed_ram: u64) {
+pub unsafe fn init(max_phys_addr: u64, fb_base: Option<u64>, fb_size: u64) {
+    // Active NXE (No-Execute Enable) dans le registre EFER
+    Efer::update(|flags| *flags |= EferFlags::NO_EXECUTE_ENABLE);
+
     let pml4 = &mut PML4.0;
 
     let kernel_flags =
@@ -378,8 +396,8 @@ pub unsafe fn init(installed_ram: u64) {
     // This allows the slab allocator and PMM to address any physical frame
     // directly without a separate virtual address allocation.
     //
-    // We align `installed_ram` up to 2 MiB to avoid a partial huge page.
-    let ram_end = align_up_2m(installed_ram);
+    // We align `max_phys_addr` up to 2 MiB to avoid a partial huge page.
+    let ram_end = align_up_2m(max_phys_addr);
     let mut phys: u64 = 0;
     while phys < ram_end {
         let virt = VirtAddr::new(RAM_DIRECT_MAP_BASE + phys);
@@ -393,15 +411,36 @@ pub unsafe fn init(installed_ram: u64) {
         RAM_DIRECT_MAP_BASE + ram_end,
         ram_end / (1024 * 1024),
     );
+    // ── C) Identity map the Framebuffer (if present and above 4 GiB) ──────────
+    if let Some(fb) = fb_base {
+        let fb_start = fb & !(pmm::HUGE_FRAME_SIZE - 1);
+        let fb_end = align_up_2m(fb + fb_size);
 
+        let mut phys = core::cmp::max(fb_start, 4 * 1024 * 1024 * 1024);
+
+        while phys < fb_end {
+            let addr = PhysAddr::new(phys);
+            map_2m(pml4, VirtAddr::new(phys), addr, kernel_flags);
+            phys += pmm::HUGE_FRAME_SIZE;
+        }
+
+        crate::kprintln!(
+            "[VMM] framebuffer mapped: 0x{:x} - 0x{:x}",
+            fb_start,
+            fb_end
+        );
+    }
     // ── Load our PML4 into CR3 ────────────────────────────────────────────────
-    //
-    // `static_virt_to_phys` works here because the kernel static is still
-    // identity-mapped (we just mapped the first 4 GiB above, which covers it).
     let pml4_phys = static_virt_to_phys(pml4 as *const PageTable);
     let pml4_frame = PhysFrame::<Size4KiB>::containing_address(pml4_phys);
 
     Cr3::write(pml4_frame, Cr3Flags::empty());
+
+    VMM_ACTIVE = true;
+    Cr3::write(pml4_frame, Cr3Flags::empty());
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
 
     crate::kprintln!("[VMM] CR3 loaded — PML4 @ {:#x}", pml4_phys.as_u64());
     crate::kprintln!("[VMM] page tables active.");
