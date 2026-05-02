@@ -243,4 +243,6 @@ pub fn _print(args: fmt::Arguments) {
         #[allow(static_mut_refs)]
         let _ = SERIAL.write_fmt(args);
     }
+    // Log to Screen (VNC terminal)
+    crate::drivers::framebuffer::print(args);
 }
