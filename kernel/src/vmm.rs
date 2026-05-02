@@ -89,9 +89,7 @@ struct AlignedPageTable(PageTable);
 
 static mut PML4: AlignedPageTable = AlignedPageTable(PageTable::new());
 
-
 static mut VMM_ACTIVE: bool = false;
-
 
 unsafe fn get_table_ptr(phys: PhysAddr) -> *mut u8 {
     if VMM_ACTIVE {
