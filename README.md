@@ -25,7 +25,6 @@ The long-term goal is a lightweight, fast-booting kernel with built-in network a
 | Brick 9 — TCP/IP Stack + e1000     | ✅ Complete   |
 | Brick 10 — Interactive Shell       | ✅ Complete   |
 | Brick 11 — GOP Framebuffer         | ✅ Complete   |
-|----------------------------------------------------|
 
 This represents KernOS v1.0.0
 
@@ -68,10 +67,6 @@ Kernel (Rust + minimal ASM, x86_64-unknown-none)
     │     ├── PCI            — config space enumeration, BAR read, bus mastering
     │     ├── Block          — 32 MiB RAM disk (512-byte sectors)
     │     ├── e1000          — Intel 82540EM NIC (QEMU), DMA TX/RX rings
-    │     └── USB
-    │           ├── xHCI    — host controller (command/event/transfer rings)
-    │           ├── Enum    — CDC-ECM device enumeration
-    │           └── RTL8153 — Realtek USB 3.0 Gigabit Ethernet (ThinkPad adapter)
     ├── Scheduler      — preemptive round-robin, APIC ~100 Hz, ASM context switch
     ├── Syscall        — syscall/sysret via STAR/LSTAR/FMASK, ring-3 via iretq
     ├── VFS
@@ -139,11 +134,6 @@ KernOS/
 │   │   │   ├── pci.rs           # PCI bus enumeration + BAR read
 │   │   │   ├── block.rs         # 32 MiB RAM disk block device
 │   │   │   ├── e1000.rs         # Intel e1000 NIC driver (QEMU)
-│   │   │   └── usb/
-│   │   │       ├── mod.rs       # USB device enumeration (CDC-ECM)
-│   │   │       ├── xhci.rs      # xHCI host controller driver
-│   │   │       ├── rtl8153.rs   # Realtek RTL8153 USB Ethernet driver
-│   │   │       └── descriptors.rs # USB standard descriptor structs
 │   │   ├── vfs/
 │   │   │   ├── mod.rs           # VFS abstraction + mount table
 │   │   │   ├── kernfs.rs        # KernFS — custom RAM filesystem
